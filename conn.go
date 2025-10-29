@@ -1491,7 +1491,7 @@ func (c *Conn) validateXCLIENTAttrs(attrs map[string]string) error {
 				return fmt.Errorf("invalid port number for PORT: %s", value)
 			}
 		case "PROTO":
-			validProtos := map[string]bool{"SMTP": true, "ESMTP": true}
+			validProtos := map[string]bool{"SMTP": true, "ESMTP": true, "LMTP": true}
 			if !validProtos[strings.ToUpper(value)] {
 				return fmt.Errorf("invalid protocol for PROTO: %s", value)
 			}

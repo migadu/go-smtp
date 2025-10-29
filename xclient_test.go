@@ -179,6 +179,15 @@ func TestValidateXCLIENTAttrs(t *testing.T) {
 			hasError: true,
 		},
 		{
+			name: "valid LMTP protocol",
+			attrs: map[string]string{
+				"ADDR":  "192.168.1.1",
+				"PORT":  "24",
+				"PROTO": "LMTP",
+				"HELO":  "example.com",
+			},
+		},
+		{
 			name: "invalid protocol",
 			attrs: map[string]string{
 				"PROTO": "HTTP",
