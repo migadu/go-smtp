@@ -241,6 +241,20 @@ func (c *Client) Hello(localName string) error {
 	return c.hello()
 }
 
+// SetLocalName sets the hostname to use in EHLO/HELO commands.
+// Must be called before Hello() or any other SMTP commands.
+// Returns an error if EHLO/HELO has already been sent.
+func (c *Client) SetLocalName(localName string) error {
+	if err := validateLine(localName); err != nil {
+		return err
+	}
+	if c.didHello {
+		return errors.New("smtp: cannot set local name after EHLO/HELO")
+	}
+	c.localName = localName
+	return nil
+}
+
 func (c *Client) readResponse(expectCode int) (int, string, error) {
 	code, msg, err := c.text.ReadResponse(expectCode)
 	if protoErr, ok := err.(*textproto.Error); ok {
