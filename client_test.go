@@ -676,6 +676,68 @@ func TestSetLocalName(t *testing.T) {
 	})
 }
 
+func TestNewClientStartTLSWithName(t *testing.T) {
+	t.Run("ValidCustomHostname", func(t *testing.T) {
+		server := `220 hello world
+250-smtp.example.com
+250 STARTTLS
+220 Ready to start TLS
+250-smtp.example.com
+250 OK
+`
+		server = strings.Join(strings.Split(server, "\n"), "\r\n")
+
+		var cmdbuf bytes.Buffer
+		bcmdbuf := bufio.NewWriter(&cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+
+		// Create client with custom hostname using the new function
+		c, err := NewClientStartTLSWithName(fake, nil, "mail.mydomain.com")
+		if err != nil {
+			// Expected to fail due to TLS upgrade on fake connection
+			// But we can verify the EHLO was sent with correct hostname
+		}
+		if c != nil {
+			defer c.Close()
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		// Check that at least the first EHLO was sent with custom hostname
+		if !strings.Contains(actualcmds, "EHLO mail.mydomain.com") {
+			t.Errorf("Expected EHLO with custom hostname, got:\n%s", actualcmds)
+		}
+	})
+
+	t.Run("InvalidHostname", func(t *testing.T) {
+		server := `220 hello world
+250-smtp.example.com
+250 STARTTLS
+`
+		server = strings.Join(strings.Split(server, "\n"), "\r\n")
+
+		var cmdbuf bytes.Buffer
+		bcmdbuf := bufio.NewWriter(&cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+
+		// Try to create client with invalid hostname
+		c, err := NewClientStartTLSWithName(fake, nil, "host\ninjection")
+		if err == nil {
+			if c != nil {
+				c.Close()
+			}
+			t.Fatal("Expected error for invalid hostname")
+		}
+
+		expectedErr := "smtp: a line must not contain CR or LF"
+		if err.Error() != expectedErr {
+			t.Errorf("Expected error %q, got %q", expectedErr, err.Error())
+		}
+	})
+}
+
 var sendMailServer = `220 hello world
 502 EH?
 250 mx.google.com at your service
