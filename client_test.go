@@ -545,6 +545,137 @@ func TestHello_421Response(t *testing.T) {
 	}
 }
 
+func TestSetLocalName(t *testing.T) {
+	t.Run("SetBeforeHello", func(t *testing.T) {
+		server := strings.Join(strings.Split(baseHelloServer, "\n"), "\r\n")
+		client := "EHLO mail.example.com\r\nHELO mail.example.com\r\n"
+		var cmdbuf bytes.Buffer
+		bcmdbuf := bufio.NewWriter(&cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+		c := NewClient(fake)
+		defer c.Close()
+
+		// Set custom local name before any SMTP commands
+		err := c.SetLocalName("mail.example.com")
+		if err != nil {
+			t.Fatalf("SetLocalName failed: %v", err)
+		}
+
+		// Trigger hello
+		err = c.hello()
+		if err != nil {
+			t.Fatalf("hello() failed: %v", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		if client != actualcmds {
+			t.Errorf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+
+	t.Run("SetAfterHello", func(t *testing.T) {
+		server := strings.Join(strings.Split(baseHelloServer, "\n"), "\r\n")
+		var cmdbuf bytes.Buffer
+		bcmdbuf := bufio.NewWriter(&cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+		c := NewClient(fake)
+		defer c.Close()
+
+		// Trigger hello first
+		err := c.hello()
+		if err != nil {
+			t.Fatalf("hello() failed: %v", err)
+		}
+
+		// Try to set local name after hello - should fail
+		err = c.SetLocalName("mail.example.com")
+		if err == nil {
+			t.Fatalf("Expected SetLocalName to fail after hello")
+		}
+		expectedErr := "smtp: cannot set local name after EHLO/HELO"
+		if err.Error() != expectedErr {
+			t.Errorf("Expected error %q, got %q", expectedErr, err.Error())
+		}
+	})
+
+	t.Run("InvalidLocalName", func(t *testing.T) {
+		c := NewClient(&faker{})
+		defer c.Close()
+
+		// Try to set local name with invalid characters
+		err := c.SetLocalName("host\ninjection")
+		if err == nil {
+			t.Fatalf("Expected SetLocalName to fail with invalid hostname")
+		}
+
+		err = c.SetLocalName("host\rinjection")
+		if err == nil {
+			t.Fatalf("Expected SetLocalName to fail with invalid hostname")
+		}
+	})
+
+	t.Run("WithNewClientStartTLS", func(t *testing.T) {
+		server := `220 hello world
+250-smtp.example.com
+250 STARTTLS
+220 Ready to start TLS
+250-smtp.example.com
+250 OK
+`
+		server = strings.Join(strings.Split(server, "\n"), "\r\n")
+		client := "EHLO mail.mydomain.com\r\nSTARTTLS\r\nEHLO mail.mydomain.com\r\n"
+
+		var cmdbuf bytes.Buffer
+		bcmdbuf := bufio.NewWriter(&cmdbuf)
+		var fake faker
+		fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+
+		c := NewClient(fake)
+		defer c.Close()
+
+		// Set custom hostname before STARTTLS
+		err := c.SetLocalName("mail.mydomain.com")
+		if err != nil {
+			t.Fatalf("SetLocalName failed: %v", err)
+		}
+
+		// Manually trigger STARTTLS flow (without actual TLS upgrade for testing)
+		err = c.hello()
+		if err != nil {
+			t.Fatalf("hello() failed: %v", err)
+		}
+
+		// Check STARTTLS extension
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			t.Fatal("Expected STARTTLS extension")
+		}
+
+		// Send STARTTLS command
+		_, _, err = c.cmd(220, "STARTTLS")
+		if err != nil {
+			t.Fatalf("STARTTLS command failed: %v", err)
+		}
+
+		// Reset didHello to simulate post-STARTTLS state
+		c.didHello = false
+
+		// Second hello after STARTTLS should use the custom name
+		err = c.hello()
+		if err != nil {
+			t.Fatalf("second hello() failed: %v", err)
+		}
+
+		bcmdbuf.Flush()
+		actualcmds := cmdbuf.String()
+		if client != actualcmds {
+			t.Errorf("Got:\n%s\nExpected:\n%s", actualcmds, client)
+		}
+	})
+}
+
 var sendMailServer = `220 hello world
 502 EH?
 250 mx.google.com at your service
