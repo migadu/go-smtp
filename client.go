@@ -630,13 +630,13 @@ func (cmd *DataCommand) CloseWithResponse() (*DataResponse, error) {
 	cmd.client.conn.SetDeadline(time.Now().Add(cmd.client.SubmissionTimeout))
 	defer cmd.client.conn.SetDeadline(time.Time{})
 
-	_, msg, err := cmd.client.readResponse(250)
+	code, msg, err := cmd.client.readResponse(250)
 	if err != nil {
 		cmd.closeErr = err
 		return nil, err
 	}
 
-	return &DataResponse{StatusText: msg}, nil
+	return &DataResponse{Code: code, StatusText: msg}, nil
 }
 
 // CloseWithLMTPResponse is equivalent to Close, but also returns per-recipient
@@ -659,7 +659,7 @@ func (cmd *DataCommand) CloseWithLMTPResponse() (map[string]*DataResponse, error
 	lmtpErr := make(LMTPDataError, len(cmd.client.rcpts))
 	for i := 0; i < len(cmd.client.rcpts); i++ {
 		rcpt := cmd.client.rcpts[i]
-		_, msg, err := cmd.client.readResponse(250)
+		code, msg, err := cmd.client.readResponse(250)
 		if err != nil {
 			if smtpErr, ok := err.(*SMTPError); ok {
 				lmtpErr[rcpt] = smtpErr
@@ -670,7 +670,7 @@ func (cmd *DataCommand) CloseWithLMTPResponse() (map[string]*DataResponse, error
 				return resp, err
 			}
 		} else {
-			resp[rcpt] = &DataResponse{StatusText: msg}
+			resp[rcpt] = &DataResponse{Code: code, StatusText: msg}
 		}
 	}
 
@@ -697,6 +697,8 @@ func (cmd *DataCommand) close() error {
 // DataResponse is the response returned by a DATA command. See
 // DataCommand.CloseWithResponse.
 type DataResponse struct {
+	// Code is the SMTP status code returned by the server.
+	Code int
 	// StatusText is the status text returned by the server. It may contain
 	// tracking information.
 	StatusText string

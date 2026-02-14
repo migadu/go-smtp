@@ -152,8 +152,13 @@ Goodbye.`
 	}
 	if resp, err := w.CloseWithResponse(); err != nil {
 		t.Fatalf("Bad data response: %s", err)
-	} else if want := "Data OK"; resp.StatusText != want {
-		t.Errorf("Bad data status text: got %q, want %q", resp.StatusText, want)
+	} else {
+		if want := "Data OK"; resp.StatusText != want {
+			t.Errorf("Bad data status text: got %q, want %q", resp.StatusText, want)
+		}
+		if resp.Code != 250 {
+			t.Errorf("Bad data status code: got %d, want 250", resp.Code)
+		}
 	}
 
 	if err := c.Quit(); err != nil {
@@ -1126,7 +1131,7 @@ Goodbye.`
 	}
 
 	wantResp := map[string]*DataResponse{
-		"golang-nuts@googlegroups.com": {StatusText: "This recipient is fine"},
+		"golang-nuts@googlegroups.com": {Code: 250, StatusText: "This recipient is fine"},
 	}
 
 	if !reflect.DeepEqual(resp, wantResp) {
