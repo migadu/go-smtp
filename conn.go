@@ -238,17 +238,24 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
-		c.reset()
-	} else {
-		sess, err := c.server.Backend.NewSession(c)
-		if err != nil {
-			c.helo = ""
-			c.writeError(451, EnhancedCode{4, 0, 0}, err)
-			return
-		}
 
-		c.setSession(sess)
+		// Free session resources before resetting
+		if err := c.session.Logout(); err != nil {
+			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
+		}
+		c.session = nil
+		c.reset()
 	}
+
+	// Create new session (whether first EHLO or re-EHLO)
+	sess, err := c.server.Backend.NewSession(c)
+	if err != nil {
+		c.helo = ""
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
+		return
+	}
+
+	c.setSession(sess)
 
 	if !enhanced {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Hello %s", domain))

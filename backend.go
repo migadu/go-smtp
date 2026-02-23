@@ -53,6 +53,12 @@ type Session interface {
 	Reset()
 
 	// Free all resources associated with session.
+	//
+	// Logout is called when:
+	// - The client issues QUIT
+	// - The connection is closed
+	// - The client issues STARTTLS (before creating a new session)
+	// - The client issues re-EHLO/re-HELO/re-LHLO (before creating a new session)
 	Logout() error
 
 	// Set return path for currently processed message.

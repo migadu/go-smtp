@@ -51,14 +51,26 @@ type backend struct {
 
 	panicOnMail bool
 	userErr     error
+
+	// Track all sessions created
+	sessions []*session
+	mu       sync.Mutex
 }
 
 func (be *backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
+	be.mu.Lock()
+	defer be.mu.Unlock()
+
+	var sess *session
 	if be.implementLMTPData {
-		return &lmtpSession{&session{backend: be, anonymous: true}}, nil
+		sess = &session{backend: be, anonymous: true}
+		be.sessions = append(be.sessions, sess)
+		return &lmtpSession{sess}, nil
 	}
 
-	return &session{backend: be, anonymous: true}, nil
+	sess = &session{backend: be, anonymous: true}
+	be.sessions = append(be.sessions, sess)
+	return sess, nil
 }
 
 type lmtpSession struct {
@@ -69,7 +81,9 @@ type session struct {
 	backend   *backend
 	anonymous bool
 
-	msg *message
+	msg         *message
+	logoutCount int
+	mu          sync.Mutex
 }
 
 var _ smtp.AuthSession = (*session)(nil)
@@ -102,7 +116,16 @@ func (s *session) Reset() {
 }
 
 func (s *session) Logout() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logoutCount++
 	return nil
+}
+
+func (s *session) getLogoutCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.logoutCount
 }
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
@@ -1710,5 +1733,114 @@ func TestServerMTPRIORITY(t *testing.T) {
 
 	if *priority != expectedPriority {
 		t.Fatal("Incorrect MtPriority parameter value:", fmt.Sprintf("expected %d, got %d", expectedPriority, *priority))
+	}
+}
+
+func TestServer_reEHLO(t *testing.T) {
+	be, s, c, scanner := testServerGreeted(t)
+	defer s.Close()
+	defer c.Close()
+
+	// First EHLO
+	io.WriteString(c, "EHLO localhost\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250-") {
+		t.Fatal("Invalid EHLO response:", scanner.Text())
+	}
+	// Consume rest of EHLO response
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	be.mu.Lock()
+	if len(be.sessions) != 1 {
+		be.mu.Unlock()
+		t.Fatal("Expected 1 session after first EHLO, got:", len(be.sessions))
+	}
+	firstSession := be.sessions[0]
+	be.mu.Unlock()
+
+	// Second EHLO (re-EHLO)
+	io.WriteString(c, "EHLO localhost\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250-") {
+		t.Fatal("Invalid re-EHLO response:", scanner.Text())
+	}
+	// Consume rest of EHLO response
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	be.mu.Lock()
+	if len(be.sessions) != 2 {
+		be.mu.Unlock()
+		t.Fatal("Expected 2 sessions after re-EHLO, got:", len(be.sessions))
+	}
+	secondSession := be.sessions[1]
+	be.mu.Unlock()
+
+	// Verify that Logout() was called on the first session
+	if count := firstSession.getLogoutCount(); count != 1 {
+		t.Fatal("Expected Logout() to be called once on first session during re-EHLO, got:", count)
+	}
+
+	// Verify that Logout() was not called on the second session yet
+	if count := secondSession.getLogoutCount(); count != 0 {
+		t.Fatal("Expected Logout() to not be called on second session yet, got:", count)
+	}
+
+	// Verify sessions are different
+	if firstSession == secondSession {
+		t.Fatal("Expected different sessions after re-EHLO")
+	}
+
+	// Third EHLO (another re-EHLO)
+	io.WriteString(c, "EHLO localhost\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250-") {
+		t.Fatal("Invalid second re-EHLO response:", scanner.Text())
+	}
+	// Consume rest of EHLO response
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	be.mu.Lock()
+	if len(be.sessions) != 3 {
+		be.mu.Unlock()
+		t.Fatal("Expected 3 sessions after second re-EHLO, got:", len(be.sessions))
+	}
+	thirdSession := be.sessions[2]
+	be.mu.Unlock()
+
+	// Verify that Logout() was called on the second session
+	if count := secondSession.getLogoutCount(); count != 1 {
+		t.Fatal("Expected Logout() to be called once on second session during second re-EHLO, got:", count)
+	}
+
+	// Verify that Logout() was not called on the third session yet
+	if count := thirdSession.getLogoutCount(); count != 0 {
+		t.Fatal("Expected Logout() to not be called on third session yet, got:", count)
+	}
+
+	// Close connection and verify final session logout
+	io.WriteString(c, "QUIT\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "221 ") {
+		t.Fatal("Invalid QUIT response:", scanner.Text())
+	}
+
+	// Give the server a moment to close the connection
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify that Logout() was called on the third session when connection closed
+	if count := thirdSession.getLogoutCount(); count != 1 {
+		t.Fatal("Expected Logout() to be called once on third session when connection closed, got:", count)
 	}
 }
