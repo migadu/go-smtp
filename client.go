@@ -127,6 +127,22 @@ func NewClientStartTLS(conn net.Conn, tlsConfig *tls.Config) (*Client, error) {
 	return c, nil
 }
 
+// NewClientStartTLSWithName creates a new Client with a custom local hostname
+// and performs a STARTTLS command. The localName parameter sets the hostname
+// used in EHLO/HELO commands instead of the default "localhost".
+func NewClientStartTLSWithName(conn net.Conn, tlsConfig *tls.Config, localName string) (*Client, error) {
+	c := NewClient(conn)
+	if err := c.SetLocalName(localName); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if err := initStartTLS(c, tlsConfig); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 func initStartTLS(c *Client, tlsConfig *tls.Config) error {
 	if err := c.hello(); err != nil {
 		return err
@@ -239,6 +255,20 @@ func (c *Client) Hello(localName string) error {
 	}
 	c.localName = localName
 	return c.hello()
+}
+
+// SetLocalName sets the hostname to use in EHLO/HELO commands.
+// Must be called before Hello() or any other SMTP commands.
+// Returns an error if EHLO/HELO has already been sent.
+func (c *Client) SetLocalName(localName string) error {
+	if err := validateLine(localName); err != nil {
+		return err
+	}
+	if c.didHello {
+		return errors.New("smtp: cannot set local name after EHLO/HELO")
+	}
+	c.localName = localName
+	return nil
 }
 
 func (c *Client) readResponse(expectCode int) (int, string, error) {
