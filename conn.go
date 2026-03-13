@@ -1015,10 +1015,12 @@ func (c *Conn) handleData(arg string) {
 		return
 	}
 
+	c.lineLimitReader.LineLimit = 0
 	r := newDataReader(c)
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	c.lineLimitReader.LineLimit = c.server.MaxLineLength
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1238,6 +1240,9 @@ func (s *statusCollector) SetStatus(rcptTo string, err error) {
 }
 
 func (c *Conn) handleDataLMTP() {
+	c.lineLimitReader.LineLimit = 0
+	defer func() { c.lineLimitReader.LineLimit = c.server.MaxLineLength }()
+
 	r := newDataReader(c)
 	status := c.createStatusCollector()
 

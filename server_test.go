@@ -1299,6 +1299,147 @@ func TestServer_Chunking_Binarymime(t *testing.T) {
 	}
 }
 
+func TestServer_LongLineInDataBody(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	// Simulate a base64-encoded attachment line exceeding MaxLineLength (2000).
+	// This is common in real-world email from senders like Amazon SES.
+	longLine := strings.Repeat("A", 2500)
+	io.WriteString(c, "Subject: test\r\n")
+	io.WriteString(c, "\r\n")
+	io.WriteString(c, longLine+"\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Long line in DATA body should be accepted, got:", scanner.Text())
+	}
+
+	if len(be.messages) != 1 {
+		t.Fatal("Expected 1 message, got:", len(be.messages))
+	}
+
+	msg := be.messages[0]
+	expected := "Subject: test\r\n\r\n" + longLine + "\r\n"
+	if string(msg.Data) != expected {
+		t.Fatalf("Invalid mail data length: got %d, want %d", len(msg.Data), len(expected))
+	}
+}
+
+func TestServer_LongLineInDataBody_LMTP(t *testing.T) {
+	be, s, c, scanner := testServer(t, func(s *smtp.Server) {
+		s.LMTP = true
+		s.Backend.(*backend).implementLMTPData = true
+		s.Backend.(*backend).lmtpStatus = []struct {
+			addr string
+			err  error
+		}{
+			{addr: "root@gchq.gov.uk", err: nil},
+		}
+	})
+	defer s.Close()
+	defer c.Close()
+
+	scanner.Scan() // greeting
+	if !strings.HasPrefix(scanner.Text(), "220 ") {
+		t.Fatal("Invalid greeting:", scanner.Text())
+	}
+
+	io.WriteString(c, "LHLO localhost\r\n")
+	scanner.Scan()
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	longLine := strings.Repeat("B", 2500)
+	io.WriteString(c, "Subject: test\r\n")
+	io.WriteString(c, "\r\n")
+	io.WriteString(c, longLine+"\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Long line in LMTP DATA body should be accepted, got:", scanner.Text())
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatal("Expected 1 message, got:", len(be.anonmsgs))
+	}
+
+	expected := "Subject: test\r\n\r\n" + longLine + "\r\n"
+	if string(be.anonmsgs[0].Data) != expected {
+		t.Fatalf("Invalid mail data length: got %d, want %d", len(be.anonmsgs[0].Data), len(expected))
+	}
+}
+
+// Verify that long SMTP command lines are still rejected (line limit
+// must be re-enabled after DATA phase completes).
+func TestServer_LineLimitRestoredAfterData(t *testing.T) {
+	_, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	// Send a message with a long body line via DATA
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	io.WriteString(c, strings.Repeat("D", 2500)+"\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("DATA should succeed:", scanner.Text())
+	}
+
+	// After DATA, line limit should be restored. A too-long command line
+	// should be rejected.
+	io.WriteString(c, "MAIL FROM:<"+strings.Repeat("x", 2000)+">\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "500 ") {
+		t.Fatal("Too-long command after DATA should be rejected, got:", scanner.Text())
+	}
+}
+
 func TestServer_TooLongCommand(t *testing.T) {
 	_, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
