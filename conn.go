@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"io/ioutil"
 	"net"
 	"net/textproto"
@@ -965,6 +966,11 @@ func (c *Conn) handleStartTLS() {
 	tlsConn := tls.Server(c.conn, c.server.TLSConfig)
 
 	if err := tlsConn.Handshake(); err != nil {
+		if c.server.ErrorLog != nil {
+			c.server.ErrorLog.Printf("STARTTLS handshake error from %v: %v", c.conn.RemoteAddr(), err)
+		} else {
+			log.Printf("STARTTLS handshake error from %v: %v", c.conn.RemoteAddr(), err)
+		}
 		c.writeResponse(550, EnhancedCode{5, 0, 0}, "Handshake error")
 		return
 	}
