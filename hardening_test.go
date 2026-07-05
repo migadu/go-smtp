@@ -269,13 +269,13 @@ type ctxSession struct{}
 
 func (ctxSession) Reset()        {}
 func (ctxSession) Logout() error { return nil }
-func (ctxSession) Mail(from string, opts *smtp.MailOptions) error {
+func (ctxSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	return nil
 }
-func (ctxSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (ctxSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	return nil
 }
-func (ctxSession) Data(r io.Reader) error {
+func (ctxSession) Data(ctx context.Context, r io.Reader) error {
 	_, err := io.Copy(io.Discard, r)
 	return err
 }

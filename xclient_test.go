@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"io"
 	"net"
 	"testing"
@@ -265,11 +266,11 @@ func (b *testBackend) NewSession(c *Conn) (Session, error) {
 
 type testSession struct{}
 
-func (s *testSession) Mail(from string, opts *MailOptions) error { return nil }
-func (s *testSession) Rcpt(to string, opts *RcptOptions) error   { return nil }
-func (s *testSession) Data(r io.Reader) error                    { return nil }
-func (s *testSession) Reset()                                    {}
-func (s *testSession) Logout() error                             { return nil }
+func (s *testSession) Mail(ctx context.Context, from string, opts *MailOptions) error { return nil }
+func (s *testSession) Rcpt(ctx context.Context, to string, opts *RcptOptions) error   { return nil }
+func (s *testSession) Data(ctx context.Context, r io.Reader) error                    { return nil }
+func (s *testSession) Reset()                                                         {}
+func (s *testSession) Logout() error                                                  { return nil }
 
 // Test server-side XCLIENT configuration states
 func TestServerXCLIENT_Configuration(t *testing.T) {

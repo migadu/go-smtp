@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -31,12 +32,12 @@ type TestSessionWithExtensions struct {
 	backend *TestBackendWithExtensions
 }
 
-func (s *TestSessionWithExtensions) Mail(from string, opts *MailOptions) error {
+func (s *TestSessionWithExtensions) Mail(ctx context.Context, from string, opts *MailOptions) error {
 	s.backend.mailFrom = from
 	return nil
 }
 
-func (s *TestSessionWithExtensions) Rcpt(to string, opts *RcptOptions) error {
+func (s *TestSessionWithExtensions) Rcpt(ctx context.Context, to string, opts *RcptOptions) error {
 	// Store a copy of the options to verify later
 	optsCopy := &RcptOptions{
 		Notify:                     opts.Notify,
@@ -56,7 +57,7 @@ func (s *TestSessionWithExtensions) Rcpt(to string, opts *RcptOptions) error {
 	return nil
 }
 
-func (s *TestSessionWithExtensions) Data(r io.Reader) error {
+func (s *TestSessionWithExtensions) Data(ctx context.Context, r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err

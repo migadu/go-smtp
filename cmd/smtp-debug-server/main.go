@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"io"
 	"log"
@@ -27,15 +28,15 @@ func (s *session) AuthPlain(username, password string) error {
 	return nil
 }
 
-func (s *session) Mail(from string, opts *smtp.MailOptions) error {
+func (s *session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
-func (s *session) Data(r io.Reader) error {
+func (s *session) Data(ctx context.Context, r io.Reader) error {
 	return nil
 }
 

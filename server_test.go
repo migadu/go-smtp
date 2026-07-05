@@ -128,7 +128,7 @@ func (s *session) getLogoutCount() int {
 	return s.logoutCount
 }
 
-func (s *session) Mail(from string, opts *smtp.MailOptions) error {
+func (s *session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	if s.backend.userErr != nil {
 		return s.backend.userErr
 	}
@@ -141,13 +141,13 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	s.msg.To = append(s.msg.To, to)
 	s.msg.RcptOpts = append(s.msg.RcptOpts, opts)
 	return nil
 }
 
-func (s *session) Data(r io.Reader) error {
+func (s *session) Data(ctx context.Context, r io.Reader) error {
 	if s.backend.dataErr != nil {
 
 		if s.backend.dataErrOffset != 0 {
@@ -180,8 +180,8 @@ func (s *session) Data(r io.Reader) error {
 	return nil
 }
 
-func (s *session) LMTPData(r io.Reader, collector smtp.StatusCollector) error {
-	if err := s.Data(r); err != nil {
+func (s *session) LMTPData(ctx context.Context, r io.Reader, collector smtp.StatusCollector) error {
+	if err := s.Data(ctx, r); err != nil {
 		return err
 	}
 

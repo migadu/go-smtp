@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"io"
 
 	"github.com/emersion/go-sasl"
@@ -48,6 +49,15 @@ func (f BackendFunc) NewSession(c *Conn) (Session, error) {
 // Session is used by servers to respond to an SMTP client.
 //
 // The methods are called when the remote client issues the matching command.
+//
+// Mail, Rcpt and Data receive a per-command context derived from the
+// connection's context (see Conn.Context): it is cancelled when the command
+// finishes, when the transaction is aborted mid-command (RSET or connection
+// close during a chunked BDAT transfer) or when the server is closed or shut
+// down. A client disconnect is only detected between commands, so it does
+// not cancel the context while a backend call is still in flight. Backends
+// should propagate the context into their I/O (database queries, upstream
+// deliveries) and may layer their own deadlines on top of it.
 type Session interface {
 	// Discard currently processed message.
 	Reset()
@@ -62,13 +72,13 @@ type Session interface {
 	Logout() error
 
 	// Set return path for currently processed message.
-	Mail(from string, opts *MailOptions) error
+	Mail(ctx context.Context, from string, opts *MailOptions) error
 	// Add recipient for currently processed message.
-	Rcpt(to string, opts *RcptOptions) error
+	Rcpt(ctx context.Context, to string, opts *RcptOptions) error
 	// Set currently processed message contents and send it.
 	//
 	// r must be consumed before Data returns.
-	Data(r io.Reader) error
+	Data(ctx context.Context, r io.Reader) error
 }
 
 // LMTPSession is an add-on interface for Session. It can be implemented by
@@ -89,7 +99,9 @@ type LMTPSession interface {
 	//
 	// Return value of LMTPData itself is used as a status for
 	// recipients that got no status set before using StatusCollector.
-	LMTPData(r io.Reader, status StatusCollector) error
+	//
+	// ctx carries the same per-command context as Session.Data.
+	LMTPData(ctx context.Context, r io.Reader, status StatusCollector) error
 }
 
 // StatusCollector allows a backend to provide per-recipient status

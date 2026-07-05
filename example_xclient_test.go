@@ -1,6 +1,7 @@
 package smtp_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +20,7 @@ type XCLIENTSession struct {
 	conn *smtp.Conn
 }
 
-func (s *XCLIENTSession) Mail(from string, opts *smtp.MailOptions) error {
+func (s *XCLIENTSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	// Access XCLIENT data to get real client information
 	xclientData := s.conn.XCLIENTData()
 	if xclientData != nil {
@@ -33,11 +34,11 @@ func (s *XCLIENTSession) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *XCLIENTSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *XCLIENTSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
-func (s *XCLIENTSession) Data(r io.Reader) error {
+func (s *XCLIENTSession) Data(ctx context.Context, r io.Reader) error {
 	return nil
 }
 

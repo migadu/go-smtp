@@ -3,6 +3,7 @@ package smtp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -30,16 +31,16 @@ type chanSession struct {
 
 func (*chanSession) Reset()        {}
 func (*chanSession) Logout() error { return nil }
-func (s *chanSession) Mail(from string, opts *MailOptions) error {
+func (s *chanSession) Mail(ctx context.Context, from string, opts *MailOptions) error {
 	if s.backend.mailed != nil {
 		s.backend.mailed <- from
 	}
 	return nil
 }
-func (*chanSession) Rcpt(to string, opts *RcptOptions) error {
+func (*chanSession) Rcpt(ctx context.Context, to string, opts *RcptOptions) error {
 	return nil
 }
-func (s *chanSession) Data(r io.Reader) error {
+func (s *chanSession) Data(ctx context.Context, r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err

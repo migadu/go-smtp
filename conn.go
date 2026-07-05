@@ -58,7 +58,8 @@ type Conn struct {
 	ctxCancel context.CancelFunc
 
 	bdatPipe      *io.PipeWriter
-	bdatStatus    *statusCollector // used for BDAT on LMTP
+	bdatCtxCancel context.CancelFunc // cancels the in-flight BDAT command context on abort
+	bdatStatus    *statusCollector   // used for BDAT on LMTP
 	dataResult    chan error
 	bytesReceived int64 // counts total size of chunks when BDAT is used
 
@@ -227,6 +228,15 @@ func (c *Conn) cancelContext() {
 	}
 }
 
+// withCommandContext runs f with the per-command context passed to
+// Session.Mail, Session.Rcpt and Session.Data, derived from the connection's
+// context. The context is cancelled when f returns, panic or not.
+func (c *Conn) withCommandContext(f func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(c.Context())
+	defer cancel()
+	return f(ctx)
+}
+
 func (c *Conn) Session() Session {
 	c.locker.Lock()
 	defer c.locker.Unlock()
@@ -247,6 +257,10 @@ func (c *Conn) Close() error {
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
+	}
+	if c.bdatCtxCancel != nil {
+		c.bdatCtxCancel()
+		c.bdatCtxCancel = nil
 	}
 	session := c.session
 	c.session = nil
@@ -576,7 +590,10 @@ func (c *Conn) handleMail(arg string) {
 		}
 	}
 
-	if err := c.Session().Mail(from, opts); err != nil {
+	err = c.withCommandContext(func(ctx context.Context) error {
+		return c.Session().Mail(ctx, from, opts)
+	})
+	if err != nil {
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -937,7 +954,10 @@ func (c *Conn) handleRcpt(arg string) {
 		}
 	}
 
-	if err := c.Session().Rcpt(recipient, opts); err != nil {
+	err = c.withCommandContext(func(ctx context.Context) error {
+		return c.Session().Rcpt(ctx, recipient, opts)
+	})
+	if err != nil {
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -1201,7 +1221,9 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
+	code, enhancedCode, msg := dataErrorToStatus(c.withCommandContext(func(ctx context.Context) error {
+		return c.Session().Data(ctx, r)
+	}))
 	r.limited = false
 	io.Copy(io.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
@@ -1259,10 +1281,27 @@ func (c *Conn) handleBdat(arg string) {
 
 		c.dataResult = make(chan error, 1)
 
+		// The data goroutine runs concurrently with the serve loop, which can
+		// abort the transfer (RSET, Close) and clear connection state under
+		// c.locker; give the goroutine stable copies instead of Conn fields.
+		recipients := append([]string(nil), c.recipients...)
+		bdatStatus := c.bdatStatus
+
+		// Unlike DATA, BDAT returns to the command loop between chunks, so
+		// the transaction can be aborted while the backend call is still in
+		// flight. A backend blocked in upstream I/O never observes the pipe's
+		// ErrDataReset; register the cancel on the Conn so reset() and
+		// Close() can deliver the abort through the context.
+		dataCtx, dataCancel := context.WithCancel(c.Context())
+		c.locker.Lock()
+		c.bdatCtxCancel = dataCancel
+		c.locker.Unlock()
+
 		go func() {
+			defer dataCancel()
 			defer func() {
 				if err := recover(); err != nil {
-					c.handlePanic(err, c.bdatStatus)
+					c.handlePanic(err, bdatStatus)
 
 					c.dataResult <- errPanic
 					r.CloseWithError(errPanic)
@@ -1271,16 +1310,16 @@ func (c *Conn) handleBdat(arg string) {
 
 			var err error
 			if !c.server.LMTP {
-				err = c.Session().Data(r)
+				err = c.Session().Data(dataCtx, r)
 			} else {
 				lmtpSession, ok := c.Session().(LMTPSession)
 				if !ok {
-					err = c.Session().Data(r)
-					for _, rcpt := range c.recipients {
-						c.bdatStatus.SetStatus(rcpt, err)
+					err = c.Session().Data(dataCtx, r)
+					for _, rcpt := range recipients {
+						bdatStatus.SetStatus(rcpt, err)
 					}
 				} else {
-					err = lmtpSession.LMTPData(r, c.bdatStatus)
+					err = lmtpSession.LMTPData(dataCtx, r, bdatStatus)
 				}
 			}
 
@@ -1426,7 +1465,9 @@ func (c *Conn) handleDataLMTP() {
 	lmtpSession, ok := c.Session().(LMTPSession)
 	if !ok {
 		// Fallback to using a single status for all recipients.
-		err := c.Session().Data(r)
+		err := c.withCommandContext(func(ctx context.Context) error {
+			return c.Session().Data(ctx, r)
+		})
 		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1448,7 +1489,9 @@ func (c *Conn) handleDataLMTP() {
 				}
 			}()
 
-			status.fillRemaining(lmtpSession.LMTPData(r, status))
+			status.fillRemaining(c.withCommandContext(func(ctx context.Context) error {
+				return lmtpSession.LMTPData(ctx, r, status)
+			}))
 			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
@@ -1885,6 +1928,12 @@ func (c *Conn) reset() {
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
+	}
+	if c.bdatCtxCancel != nil {
+		// The pipe error only reaches a backend that is reading the message;
+		// cancelling the command context aborts one blocked in upstream I/O.
+		c.bdatCtxCancel()
+		c.bdatCtxCancel = nil
 	}
 	c.bdatStatus = nil
 	c.bytesReceived = 0

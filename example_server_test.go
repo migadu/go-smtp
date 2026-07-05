@@ -1,6 +1,7 @@
 package smtp_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -40,7 +41,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 	}), nil
 }
 
-func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
+func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	if !s.auth {
 		return smtp.ErrAuthRequired
 	}
@@ -48,7 +49,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	if !s.auth {
 		return smtp.ErrAuthRequired
 	}
@@ -56,7 +57,7 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
-func (s *Session) Data(r io.Reader) error {
+func (s *Session) Data(ctx context.Context, r io.Reader) error {
 	if !s.auth {
 		return smtp.ErrAuthRequired
 	}
