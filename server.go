@@ -57,6 +57,17 @@ type Server struct {
 	// long-running work.
 	BaseContext func(l net.Listener) context.Context
 
+	// OnTimeout, if set, is called exactly once when the server disconnects
+	// a client whose read deadline (ReadTimeout) expired while waiting for
+	// input — between commands or during a SASL continuation. It fires after
+	// the "421 4.4.2 Idle timeout" response is written and before the
+	// connection closes. Intended for metrics; keep it fast and
+	// non-blocking. The server owns the idle timer, so an embedder that also
+	// wraps the net.Conn in its own idle checker should disarm that checker
+	// and count disconnects from this hook instead — two owners of the same
+	// timer race each other and can send the client a duplicate notice.
+	OnTimeout func()
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

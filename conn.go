@@ -331,6 +331,12 @@ func (c *Conn) readError(err error) error {
 	}
 	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 		c.writeResponse(421, EnhancedCode{4, 4, 2}, "Idle timeout, bye bye")
+		// At most once per connection: both readError call sites are
+		// terminal, and a post-Close re-entry takes the ErrClosed branch
+		// above before reaching here.
+		if h := c.server.OnTimeout; h != nil {
+			h()
+		}
 		return nil
 	}
 	c.writeResponse(421, EnhancedCode{4, 4, 0}, "Connection error, sorry")
