@@ -1,12 +1,13 @@
 package smtp
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/textproto"
@@ -23,6 +24,11 @@ import (
 // Number of errors we'll tolerate per connection before closing. Defaults to 3.
 const errThreshold = 3
 
+// Number of failed AUTH attempts we'll tolerate per connection before
+// closing. RFC 4954 recommends limiting these to slow down online
+// brute-force attacks against credentials.
+const maxAuthFailures = 3
+
 type Conn struct {
 	conn   net.Conn
 	text   *textproto.Conn
@@ -32,15 +38,29 @@ type Conn struct {
 	// Number of errors witnessed on this connection
 	errCount int
 
+	// Number of failed AUTH attempts witnessed on this connection
+	authFailures int
+
+	// First error encountered while writing a response. Once set, the serve
+	// loop tears the connection down: the client can no longer observe
+	// replies, so processing further commands is pointless. Only accessed
+	// from the connection's serve goroutine.
+	writeFailure error
+
 	session    Session
 	locker     sync.Mutex
 	binarymime bool
 
-	lineLimitReader *lineLimitReader
-	bdatPipe        *io.PipeWriter
-	bdatStatus      *statusCollector // used for BDAT on LMTP
-	dataResult      chan error
-	bytesReceived   int64 // counts total size of chunks when BDAT is used
+	// Connection-scoped context, derived from Server.BaseContext (or
+	// context.Background) and cancelled when connection handling ends or the
+	// server is closed / shut down. Guarded by locker.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	bdatPipe      *io.PipeWriter
+	bdatStatus    *statusCollector // used for BDAT on LMTP
+	dataResult    chan error
+	bytesReceived int64 // counts total size of chunks when BDAT is used
 
 	fromReceived bool
 	recipients   []string
@@ -61,16 +81,16 @@ func newConn(c net.Conn, s *Server) *Conn {
 }
 
 func (c *Conn) init() {
-	c.lineLimitReader = &lineLimitReader{
-		R:         c.conn,
-		LineLimit: c.server.MaxLineLength,
-	}
+	// The line-length limit is enforced by readLine on the lines it parses,
+	// not by a limiting reader on the raw stream: raw-stream counting would
+	// falsely attribute read-ahead bytes (e.g. a pipelined BDAT chunk sitting
+	// in the buffer behind its command) to the command line being read.
 	rwc := struct {
 		io.Reader
 		io.Writer
 		io.Closer
 	}{
-		Reader: c.lineLimitReader,
+		Reader: c.conn,
 		Writer: c.conn,
 		Closer: c.conn,
 	}
@@ -88,6 +108,15 @@ func (c *Conn) init() {
 	}
 
 	c.text = textproto.NewConn(rwc)
+
+	// Shrink the read buffer so that an over-long line fills it and surfaces
+	// as an isPrefix read in readLine after at most MaxLineLength+2 bytes,
+	// instead of only once bufio's default 4096-byte buffer fills. This keeps
+	// the "500 Too long line" reply eager: it is sent as soon as the limit is
+	// exceeded, without waiting for the client to send a newline.
+	if lim := c.server.MaxLineLength; lim > 0 && lim+2 < 4096 {
+		c.text.R = bufio.NewReaderSize(rwc, lim+2)
+	}
 }
 
 // Commands are dispatched to the appropriate handler functions.
@@ -160,6 +189,44 @@ func (c *Conn) Server() *Server {
 	return c.server
 }
 
+// bindContext derives the connection's context from base. It is called by
+// Server.Serve before connection handling starts.
+func (c *Conn) bindContext(base context.Context) {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.ctx, c.ctxCancel = context.WithCancel(base)
+}
+
+// Context returns the connection's context. It is derived from
+// Server.BaseContext (or context.Background if unset) and is cancelled when
+// connection handling ends — the client disconnected, issued QUIT or caused a
+// fatal error — or when the server is closed or shut down.
+//
+// Backends can capture it in Backend.NewSession and use it to abort
+// long-running work (e.g. an upstream delivery) once the result can no longer
+// be observed by the client, and to propagate request-scoped values from
+// BaseContext into backend calls.
+func (c *Conn) Context() context.Context {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.ctx == nil {
+		// Conn was not created through Server.Serve (e.g. tests driving
+		// handleConn directly); fall back to a self-contained context.
+		c.ctx, c.ctxCancel = context.WithCancel(context.Background())
+	}
+	return c.ctx
+}
+
+// cancelContext cancels the connection's context, if one was created.
+func (c *Conn) cancelContext() {
+	c.locker.Lock()
+	cancel := c.ctxCancel
+	c.locker.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 func (c *Conn) Session() Session {
 	c.locker.Lock()
 	defer c.locker.Unlock()
@@ -173,26 +240,36 @@ func (c *Conn) setSession(session Session) {
 }
 
 func (c *Conn) Close() error {
+	// Take what we need under the lock, but call Logout and Close outside of
+	// it: backends may call locked Conn accessors (Session, TLSConnectionState,
+	// ...) from within Logout, which would deadlock otherwise.
 	c.locker.Lock()
-	defer c.locker.Unlock()
-
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
 	}
+	session := c.session
+	c.session = nil
+	conn := c.conn
+	c.locker.Unlock()
 
-	if c.session != nil {
-		c.session.Logout()
-		c.session = nil
+	if session != nil {
+		session.Logout()
 	}
 
-	return c.conn.Close()
+	return conn.Close()
 }
 
 // TLSConnectionState returns the connection's TLS connection state.
 // Zero values are returned if the connection doesn't use TLS.
 func (c *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
-	tc, ok := c.conn.(*tls.Conn)
+	// c.conn is swapped by handleStartTLS under c.locker; read it under the
+	// same lock so callers on other goroutines don't race the swap.
+	c.locker.Lock()
+	conn := c.conn
+	c.locker.Unlock()
+
+	tc, ok := conn.(*tls.Conn)
 	if !ok {
 		return
 	}
@@ -204,6 +281,8 @@ func (c *Conn) Hostname() string {
 }
 
 func (c *Conn) Conn() net.Conn {
+	c.locker.Lock()
+	defer c.locker.Unlock()
 	return c.conn
 }
 
@@ -224,6 +303,38 @@ func (c *Conn) protocolError(code int, ec EnhancedCode, msg string) {
 	}
 }
 
+// readError writes the response owed to the client for a failed line read,
+// if any, and returns the error the server should report (nil for expected
+// conditions such as a clean disconnect, an idle timeout or an over-long
+// line).
+func (c *Conn) readError(err error) error {
+	if err == io.EOF || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	if err == ErrTooLongLine {
+		c.writeResponse(500, EnhancedCode{5, 4, 0}, "Too long line, closing connection")
+		return nil
+	}
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		c.writeResponse(421, EnhancedCode{4, 4, 2}, "Idle timeout, bye bye")
+		return nil
+	}
+	c.writeResponse(421, EnhancedCode{4, 4, 0}, "Connection error, sorry")
+	return err
+}
+
+// authFailed writes an authentication error response and closes the
+// connection once too many failed AUTH attempts have occurred.
+func (c *Conn) authFailed(code int, ec EnhancedCode, err error) {
+	c.writeError(code, ec, err)
+
+	c.authFailures++
+	if c.authFailures >= maxAuthFailures {
+		c.writeResponse(421, EnhancedCode{4, 7, 0}, "Too many failed authentication attempts, closing connection")
+		c.Close()
+	}
+}
+
 // GREET state -> waiting for HELO
 func (c *Conn) handleGreet(enhanced bool, arg string) {
 	domain, err := parseHelloArgument(arg)
@@ -236,15 +347,18 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	c.helo = domain
 
 	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
-	if c.session != nil {
+	// Access the session through the locked accessors: Conn.Close (via
+	// Server.Close/Shutdown on another goroutine) writes c.session
+	// concurrently.
+	if session := c.Session(); session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
 
 		// Free session resources before resetting
-		if err := c.session.Logout(); err != nil {
+		if err := session.Logout(); err != nil {
 			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
 		}
-		c.session = nil
+		c.setSession(nil)
 		c.reset()
 	}
 
@@ -338,6 +452,13 @@ func (c *Conn) handleMail(arg string) {
 	}
 	if c.bdatPipe != nil {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		return
+	}
+	// RFC 5321 section 4.1.1.2: MAIL is only permitted when there is no
+	// transaction in progress; a nested MAIL gets 503, the client must
+	// RSET (or finish the transaction) first.
+	if c.fromReceived {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Sender already specified")
 		return
 	}
 
@@ -435,7 +556,7 @@ func (c *Conn) handleMail(arg string) {
 		case "AUTH":
 			value, err := decodeXtext(value)
 			if err != nil || value == "" {
-				c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
 				return
 			}
 			if value == "<>" {
@@ -444,7 +565,7 @@ func (c *Conn) handleMail(arg string) {
 				p := parser{s: value}
 				value, err = p.parseMailbox()
 				if err != nil || p.s != "" {
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter mailbox")
+					c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter mailbox")
 					return
 				}
 			}
@@ -877,14 +998,14 @@ func (c *Conn) handleAuth(arg string) {
 		var err error
 		ir, err = decodeSASLResponse(parts[1])
 		if err != nil {
-			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
+			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
 			return
 		}
 	}
 
 	sasl, err := c.auth(mechanism)
 	if err != nil {
-		c.writeError(454, EnhancedCode{4, 7, 0}, err)
+		c.authFailed(454, EnhancedCode{4, 7, 0}, err)
 		return
 	}
 
@@ -892,7 +1013,7 @@ func (c *Conn) handleAuth(arg string) {
 	for {
 		challenge, done, err := sasl.Next(response)
 		if err != nil {
-			c.writeError(454, EnhancedCode{4, 7, 0}, err)
+			c.authFailed(454, EnhancedCode{4, 7, 0}, err)
 			return
 		}
 
@@ -908,7 +1029,14 @@ func (c *Conn) handleAuth(arg string) {
 
 		encoded, err = c.readLine()
 		if err != nil {
-			return // TODO: error handling
+			// The SASL exchange cannot continue: report the read failure the
+			// same way the serve loop would and drop the connection.
+			// Returning silently would desync the session — the client's
+			// next line, meant as a SASL response, would be parsed as an
+			// SMTP command.
+			c.readError(err)
+			c.Close()
+			return
 		}
 
 		if encoded == "*" {
@@ -919,7 +1047,7 @@ func (c *Conn) handleAuth(arg string) {
 
 		response, err = decodeSASLResponse(encoded)
 		if err != nil {
-			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
+			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
 			return
 		}
 	}
@@ -1072,12 +1200,10 @@ func (c *Conn) handleData(arg string) {
 		return
 	}
 
-	c.lineLimitReader.LineLimit = 0
 	r := newDataReader(c)
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
-	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
-	c.lineLimitReader.LineLimit = c.server.MaxLineLength
+	io.Copy(io.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1117,7 +1243,7 @@ func (c *Conn) handleBdat(arg string) {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
-		io.Copy(ioutil.Discard, io.LimitReader(c.text.R, int64(size)))
+		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
 
 		c.reset()
 		return
@@ -1163,14 +1289,12 @@ func (c *Conn) handleBdat(arg string) {
 		}()
 	}
 
-	c.lineLimitReader.LineLimit = 0
-
 	chunk := io.LimitReader(c.text.R, int64(size))
 	_, err = io.Copy(c.bdatPipe, chunk)
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
 		// the whole chunk.
-		io.Copy(ioutil.Discard, chunk)
+		io.Copy(io.Discard, chunk)
 
 		c.writeResponse(dataErrorToStatus(err))
 
@@ -1179,15 +1303,12 @@ func (c *Conn) handleBdat(arg string) {
 		}
 
 		c.reset()
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
 		return
 	}
 
 	c.bytesReceived += int64(size)
 
 	if last {
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
-
 		c.bdatPipe.Close()
 
 		err := <-c.dataResult
@@ -1297,9 +1418,6 @@ func (s *statusCollector) SetStatus(rcptTo string, err error) {
 }
 
 func (c *Conn) handleDataLMTP() {
-	c.lineLimitReader.LineLimit = 0
-	defer func() { c.lineLimitReader.LineLimit = c.server.MaxLineLength }()
-
 	r := newDataReader(c)
 	status := c.createStatusCollector()
 
@@ -1309,7 +1427,7 @@ func (c *Conn) handleDataLMTP() {
 	if !ok {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
-		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
 		}
@@ -1331,7 +1449,7 @@ func (c *Conn) handleDataLMTP() {
 			}()
 
 			status.fillRemaining(lmtpSession.LMTPData(r, status))
-			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
 	}
@@ -1374,7 +1492,13 @@ func (c *Conn) greet() {
 }
 
 func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
-	// TODO: error handling
+	// Once a response write has failed the connection is done for; don't
+	// bother the socket with further writes, the serve loop is about to
+	// tear the connection down.
+	if c.writeFailure != nil {
+		return
+	}
+
 	if c.server.WriteTimeout != 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.server.WriteTimeout))
 	}
@@ -1394,14 +1518,29 @@ func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
 	// transform each single line with \n, into separate lines
 	text = strings.Split(strings.Join(text, "\n"), "\n")
 
+	// Strip CR from every line: backend-provided text containing \r\n would
+	// otherwise leave a trailing \r after the split above (yielding \r\r\n on
+	// the wire), and a bare CR inside a reply line is invalid in SMTP. The
+	// wire-format CRLF is appended by PrintfLine below.
+	for i := range text {
+		text[i] = strings.ReplaceAll(text[i], "\r", "")
+	}
+
 	lastLineIndex := len(text) - 1
 	for i := 0; i < lastLineIndex; i++ {
-		c.text.PrintfLine("%d-%v", code, text[i])
+		if err := c.text.PrintfLine("%d-%v", code, text[i]); err != nil {
+			c.writeFailure = err
+			return
+		}
 	}
+	var err error
 	if enhCode == NoEnhancedCode {
-		c.text.PrintfLine("%d %v", code, text[lastLineIndex])
+		err = c.text.PrintfLine("%d %v", code, text[lastLineIndex])
 	} else {
-		c.text.PrintfLine("%d %v.%v.%v %v", code, enhCode[0], enhCode[1], enhCode[2], text[lastLineIndex])
+		err = c.text.PrintfLine("%d %v.%v.%v %v", code, enhCode[0], enhCode[1], enhCode[2], text[lastLineIndex])
+	}
+	if err != nil {
+		c.writeFailure = err
 	}
 }
 
@@ -1413,7 +1552,9 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 	}
 }
 
-// Reads a line of input
+// Reads a line of input, enforcing Server.MaxLineLength on the line itself
+// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
+// chunk following its command — do not count toward the limit.
 func (c *Conn) readLine() (string, error) {
 	if c.server.ReadTimeout != 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.server.ReadTimeout)); err != nil {
@@ -1421,7 +1562,24 @@ func (c *Conn) readLine() (string, error) {
 		}
 	}
 
-	return c.text.ReadLine()
+	var line []byte
+	for {
+		l, more, err := c.text.R.ReadLine()
+		if err != nil {
+			return "", err
+		}
+		line = append(line, l...)
+
+		// Check while the line accumulates, not just at the end, so memory
+		// stays bounded by MaxLineLength plus one buffer fill even when the
+		// client never sends a newline.
+		if c.server.MaxLineLength > 0 && len(line) > c.server.MaxLineLength {
+			return "", ErrTooLongLine
+		}
+		if !more {
+			return string(line), nil
+		}
+	}
 }
 
 // validateXRCPTFORWARD validates an XRCPTFORWARD parameter value according to Dovecot specification

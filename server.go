@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -40,6 +41,21 @@ type Server struct {
 	ErrorLog          Logger
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
+
+	// Maximum number of concurrently open connections the server accepts.
+	// Connections above the limit are rejected with a 421 reply and closed.
+	// If zero, there is no limit.
+	MaxConnections int
+
+	// BaseContext optionally specifies a function that returns the base
+	// context for connections accepted on listener l. If nil,
+	// context.Background() is used.
+	//
+	// The context of each connection (see Conn.Context) is derived from it
+	// and cancelled when connection handling ends or when the server is
+	// closed or shut down, giving backends a cancellation signal for
+	// long-running work.
+	BaseContext func(l net.Listener) context.Context
 
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
@@ -132,6 +148,14 @@ func (s *Server) Serve(l net.Listener) error {
 	s.listeners = append(s.listeners, l)
 	s.locker.Unlock()
 
+	baseCtx := context.Background()
+	if s.BaseContext != nil {
+		baseCtx = s.BaseContext(l)
+		if baseCtx == nil {
+			panic("smtp: Server.BaseContext returned a nil context")
+		}
+	}
+
 	var tempDelay time.Duration // how long to sleep on accept failure
 
 	for {
@@ -143,7 +167,9 @@ func (s *Server) Serve(l net.Listener) error {
 				return nil
 			default:
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			// net.Error.Temporary is deprecated; assert on the capability
+			// directly to keep the historical retry-with-backoff behaviour.
+			if ne, ok := err.(interface{ Temporary() bool }); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -159,11 +185,14 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 
+		conn := newConn(c, s)
+		conn.bindContext(baseCtx)
+
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 
-			err := s.handleConn(newConn(c, s))
+			err := s.handleConn(conn)
 			if err != nil {
 				s.ErrorLog.Printf("error handling %v: %s", c.RemoteAddr(), err)
 			}
@@ -172,9 +201,31 @@ func (s *Server) Serve(l net.Listener) error {
 }
 
 func (s *Server) handleConn(c *Conn) error {
+	defer c.cancelContext()
+
+	// Check the connection cap and register atomically so concurrent accepts
+	// cannot overshoot MaxConnections.
 	s.locker.Lock()
+	if s.MaxConnections > 0 && len(s.conns) >= s.MaxConnections {
+		s.locker.Unlock()
+		c.Reject()
+		return nil
+	}
 	s.conns[c] = struct{}{}
 	s.locker.Unlock()
+
+	// Cancel the connection's context when the server is closed or shut down
+	// so blocked backend calls (e.g. Session.Data writing to a hung upstream)
+	// receive a cancellation signal. The watcher exits once the connection's
+	// own context is cancelled by the deferred cancelContext above.
+	ctx := c.Context()
+	go func() {
+		select {
+		case <-s.done:
+			c.cancelContext()
+		case <-ctx.Done():
+		}
+	}()
 
 	defer func() {
 		c.Close()
@@ -199,33 +250,38 @@ func (s *Server) handleConn(c *Conn) error {
 	c.greet()
 
 	for {
-		line, err := c.readLine()
-		if err == nil {
-			cmd, arg, err := parseCmd(line)
-			if err != nil {
-				c.protocolError(501, EnhancedCode{5, 5, 2}, "Bad command")
-				continue
-			}
-
-			c.handle(cmd, arg)
-		} else {
-			if err == io.EOF || errors.Is(err, net.ErrClosed) {
+		// A failed response write means the client can no longer observe
+		// replies; processing further commands would run backend calls whose
+		// outcome is unobservable. Stop here instead.
+		if c.writeFailure != nil {
+			if isPeerDisconnect(c.writeFailure) {
 				return nil
 			}
-			if err == ErrTooLongLine {
-				c.writeResponse(500, EnhancedCode{5, 4, 0}, "Too long line, closing connection")
-				return nil
-			}
-
-			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-				c.writeResponse(421, EnhancedCode{4, 4, 2}, "Idle timeout, bye bye")
-				return nil
-			}
-
-			c.writeResponse(421, EnhancedCode{4, 4, 0}, "Connection error, sorry")
-			return err
+			return c.writeFailure
 		}
+
+		line, err := c.readLine()
+		if err != nil {
+			return c.readError(err)
+		}
+
+		cmd, arg, err := parseCmd(line)
+		if err != nil {
+			c.protocolError(501, EnhancedCode{5, 5, 2}, "Bad command")
+			continue
+		}
+
+		c.handle(cmd, arg)
 	}
+}
+
+// isPeerDisconnect reports whether a write error merely indicates that the
+// client went away — a routine event not worth reporting to the error log.
+func isPeerDisconnect(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func (s *Server) network() string {
@@ -309,7 +365,10 @@ func (s *Server) Close() error {
 // Shutdown gracefully shuts down the server without interrupting any
 // active connections. Shutdown works by first closing all open
 // listeners and then waiting indefinitely for connections to return to
-// idle and then shut down.
+// idle and then shut down. Each connection's context (see Conn.Context)
+// is cancelled at the start of the shutdown, allowing backends to abort
+// long-running work; connections themselves are left open until they
+// finish.
 // If the provided context expires before the shutdown is complete,
 // Shutdown returns the context's error, otherwise it returns any
 // error returned from closing the Server's underlying Listener(s).
