@@ -42,3 +42,36 @@ func TestParser(t *testing.T) {
 		}
 	}
 }
+
+func TestParseArgs(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want map[string]string
+	}{
+		{" BODY=8BITMIME SIZE=1024 SMTPUTF8", map[string]string{
+			"BODY": "8BITMIME", "SIZE": "1024", "SMTPUTF8": "",
+		}},
+		// Values may contain '=', e.g. base64 padding in AUTH (RFC 4954)
+		// or xtext-free ORCPT values; only the first '=' separates the key.
+		{" AUTH=dXNlcg==", map[string]string{"AUTH": "dXNlcg=="}},
+		{" ORCPT=rfc822;user=x@example.org", map[string]string{
+			"ORCPT": "rfc822;user=x@example.org",
+		}},
+	}
+	for _, tc := range tests {
+		got, err := parseArgs(tc.raw)
+		if err != nil {
+			t.Errorf("parseArgs(%q) = %v", tc.raw, err)
+			continue
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("parseArgs(%q) = %v, want %v", tc.raw, got, tc.want)
+			continue
+		}
+		for k, v := range tc.want {
+			if got[k] != v {
+				t.Errorf("parseArgs(%q)[%q] = %q, want %q", tc.raw, k, got[k], v)
+			}
+		}
+	}
+}
