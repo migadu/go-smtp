@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -1285,6 +1286,78 @@ func TestServer_TooLongCommand(t *testing.T) {
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "500 5.4.0 ") {
 		t.Fatal("Invalid too long MAIL response:", scanner.Text())
+	}
+}
+
+// readUntilClosed drains c until EOF/reset and returns everything read.
+// It fails the test if the read blocks until the deadline instead of the
+// server closing the connection.
+func readUntilClosed(t *testing.T, c net.Conn) []byte {
+	t.Helper()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	data, err := io.ReadAll(c)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatal("Connection was not closed by the server")
+		}
+		// Other errors (e.g. connection reset) also mean the server
+		// dropped the connection, which is what we expect.
+	}
+	return data
+}
+
+func TestStartTLS_handshakeFailureClosesConnection(t *testing.T) {
+	_, s, c, scanner, caps := testServerEhlo(t, func(s *smtp.Server) {
+		s.TLSConfig = &tls.Config{}
+	})
+	defer s.Close()
+	defer c.Close()
+
+	if _, ok := caps["STARTTLS"]; !ok {
+		t.Fatal("STARTTLS capability is missing")
+	}
+
+	io.WriteString(c, "STARTTLS\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "220 ") {
+		t.Fatal("Invalid STARTTLS response:", scanner.Text())
+	}
+
+	// Not a TLS ClientHello: the handshake fails and the plaintext stream is
+	// desynchronized, so the server must close the connection instead of
+	// writing a plaintext response into it.
+	io.WriteString(c, "this is not a TLS handshake\r\n")
+
+	data := readUntilClosed(t, c)
+	if strings.Contains(string(data), "550 ") {
+		t.Fatal("Server wrote a plaintext response into a desynchronized stream:", string(data))
+	}
+}
+
+func TestStartTLS_rejectsPipelinedCommands(t *testing.T) {
+	_, s, c, scanner, caps := testServerEhlo(t, func(s *smtp.Server) {
+		s.TLSConfig = &tls.Config{}
+	})
+	defer s.Close()
+	defer c.Close()
+
+	if _, ok := caps["STARTTLS"]; !ok {
+		t.Fatal("STARTTLS capability is missing")
+	}
+
+	// Plaintext command injection (CVE-2011-0411 pattern): commands pipelined
+	// after STARTTLS were received outside TLS and must not be executed as if
+	// they had arrived inside the encrypted channel.
+	io.WriteString(c, "STARTTLS\r\nNOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "220 ") {
+		t.Fatal("Invalid STARTTLS response:", scanner.Text())
+	}
+
+	data := readUntilClosed(t, c)
+	if strings.Contains(string(data), "250 ") {
+		t.Fatal("Server executed a command injected before the TLS handshake:", string(data))
 	}
 }
 
