@@ -623,6 +623,56 @@ func TestServer(t *testing.T) {
 	}
 }
 
+func TestServer_dataLineExceedingMaxLineLength(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	// MaxLineLength applies to the command phase only; message data lines
+	// may exceed it.
+	longLine := strings.Repeat("a", 2*s.MaxLineLength)
+	io.WriteString(c, "From: root@nsa.gov\r\n")
+	io.WriteString(c, "\r\n")
+	io.WriteString(c, longLine+"\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	if len(be.messages) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.messages))
+	}
+	if string(be.messages[0].Data) != "From: root@nsa.gov\r\n\r\n"+longLine+"\r\n" {
+		t.Fatal("Invalid mail data:", string(be.messages[0].Data))
+	}
+
+	// The command phase must still enforce MaxLineLength after DATA.
+	io.WriteString(c, "MAIL FROM:<"+strings.Repeat("a", s.MaxLineLength)+">\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "500 5.4.0 ") {
+		t.Fatal("Invalid too long MAIL response:", scanner.Text())
+	}
+}
+
 func TestServer_LFDotLF(t *testing.T) {
 	be, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
