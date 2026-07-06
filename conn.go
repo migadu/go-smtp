@@ -929,15 +929,55 @@ func (c *Conn) handleStartTLS() {
 
 	c.writeResponse(220, EnhancedCode{2, 0, 0}, "Ready to start TLS")
 
+	// Defense against the STARTTLS plaintext command injection attack: any
+	// bytes buffered past the STARTTLS line were received before the TLS
+	// handshake and must never be interpreted as if they had arrived inside
+	// the encrypted channel. Their presence indicates an injection attempt, so
+	// abort the connection rather than silently discarding them.
+	if n := c.text.R.Buffered(); n > 0 {
+		c.server.ErrorLog.Printf("starttls: %d buffered bytes before TLS handshake, possible plaintext command injection", n)
+		c.Close()
+		// Closing the socket is not enough: the buffered plaintext still lives
+		// in c.text's reader and the serve loop would otherwise read and
+		// dispatch it as commands. Rebuild the reader over the now-closed
+		// connection so the buffered bytes are discarded and the next read
+		// fails, ending the serve loop.
+		c.init()
+		return
+	}
+
+	// Apply fresh deadlines for the handshake so a client that stalls
+	// mid-handshake cannot pin this goroutine indefinitely. This mirrors the
+	// implicit-TLS path in Server.handleConn; without it the STARTTLS handshake
+	// would run under whatever stale deadline the previous read/write left, or
+	// none at all when timeouts are disabled.
+	if d := c.server.ReadTimeout; d != 0 {
+		c.conn.SetReadDeadline(time.Now().Add(d))
+	}
+	if d := c.server.WriteTimeout; d != 0 {
+		c.conn.SetWriteDeadline(time.Now().Add(d))
+	}
+
 	// Upgrade to TLS
 	tlsConn := tls.Server(c.conn, c.server.TLSConfig)
 
 	if err := tlsConn.Handshake(); err != nil {
-		c.writeResponse(550, EnhancedCode{5, 0, 0}, "Handshake error")
+		c.server.ErrorLog.Printf("starttls: handshake failed: %v", err)
+		// The TLS layer has already consumed bytes from the connection and the
+		// peer expects TLS records, so the plaintext stream is desynchronized.
+		// Close rather than attempting to continue or to write a plaintext
+		// response the peer cannot interpret.
+		c.Close()
 		return
 	}
 
+	// Guard the connection swap with c.locker: Conn.Close() reads c.conn under
+	// the same lock and can run on a different goroutine during
+	// Server.Close/Shutdown. Without this, the unsynchronized write to c.conn
+	// races that locked read (a torn read of the interface value could crash).
+	c.locker.Lock()
 	c.conn = tlsConn
+	c.locker.Unlock()
 	c.init()
 
 	// Reset all state and close the previous Session.
