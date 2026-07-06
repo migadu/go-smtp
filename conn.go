@@ -233,17 +233,28 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
-		c.reset()
-	} else {
-		sess, err := c.server.Backend.NewSession(c)
-		if err != nil {
-			c.helo = ""
-			c.writeError(451, EnhancedCode{4, 0, 0}, err)
-			return
-		}
 
-		c.setSession(sess)
+		// Tear the session down entirely instead of only resetting it, so the
+		// backend re-evaluates the connection in NewSession below. Backends
+		// use NewSession for per-connection policy (reverse DNS, DNSBL,
+		// reputation); a long-lived connection that re-issues EHLO must not
+		// keep a session created before those signals changed.
+		if err := c.session.Logout(); err != nil {
+			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
+		}
+		c.setSession(nil)
+		c.reset()
 	}
+
+	// Create a new session, whether this is the first EHLO or a re-EHLO.
+	sess, err := c.server.Backend.NewSession(c)
+	if err != nil {
+		c.helo = ""
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
+		return
+	}
+
+	c.setSession(sess)
 
 	if !enhanced {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Hello %s", domain))

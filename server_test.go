@@ -30,6 +30,9 @@ type message struct {
 type backend struct {
 	authDisabled bool
 
+	// Number of times NewSession was called.
+	sessions int
+
 	messages []*message
 	anonmsgs []*message
 
@@ -54,6 +57,7 @@ type backend struct {
 }
 
 func (be *backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
+	be.sessions++
 	if be.implementLMTPData {
 		return &lmtpSession{&session{backend: be, anonymous: true}}, nil
 	}
@@ -352,6 +356,32 @@ func TestServer_helo(t *testing.T) {
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid HELO response:", scanner.Text())
+	}
+}
+
+func TestServer_reEhloCreatesNewSession(t *testing.T) {
+	be, s, c, scanner, _ := testServerEhlo(t)
+	defer s.Close()
+	defer c.Close()
+
+	if be.sessions != 1 {
+		t.Fatal("Invalid number of sessions after first EHLO:", be.sessions)
+	}
+
+	// RFC 5321 allows EHLO later in the session; the backend must get a fresh
+	// session so it can re-evaluate per-connection policy in NewSession.
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+		if !strings.HasPrefix(scanner.Text(), "250-") {
+			t.Fatal("Invalid EHLO response:", scanner.Text())
+		}
+	}
+
+	if be.sessions != 2 {
+		t.Fatal("Invalid number of sessions after re-EHLO:", be.sessions)
 	}
 }
 
