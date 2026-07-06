@@ -983,10 +983,15 @@ func (c *Conn) handleData(arg string) {
 		return
 	}
 
+	// The line length limit only applies to the SMTP command phase; message
+	// data is bounded by MaxMessageBytes instead (RFC 5322 line lengths are
+	// commonly exceeded in practice, e.g. by unwrapped HTML bodies).
+	c.lineLimitReader.LineLimit = 0
 	r := newDataReader(c)
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	c.lineLimitReader.LineLimit = c.server.MaxLineLength
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1206,6 +1211,10 @@ func (s *statusCollector) SetStatus(rcptTo string, err error) {
 }
 
 func (c *Conn) handleDataLMTP() {
+	// See handleData: the line length limit does not apply to message data.
+	c.lineLimitReader.LineLimit = 0
+	defer func() { c.lineLimitReader.LineLimit = c.server.MaxLineLength }()
+
 	r := newDataReader(c)
 	status := c.createStatusCollector()
 
