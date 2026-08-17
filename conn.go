@@ -1661,6 +1661,7 @@ func (c *Conn) handleDataLMTP() {
 		err := c.withCommandContext(func(ctx context.Context) error {
 			return c.Session().Data(ctx, r)
 		})
+		r.limited = false
 		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1685,6 +1686,7 @@ func (c *Conn) handleDataLMTP() {
 			status.fillRemaining(c.withCommandContext(func(ctx context.Context) error {
 				return lmtpSession.LMTPData(ctx, r, status)
 			}))
+			r.limited = false
 			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
