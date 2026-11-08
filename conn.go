@@ -33,7 +33,7 @@ type Conn struct {
 	conn               net.Conn
 	text               *textproto.Conn
 	server             *Server
-	helo               string
+	helo               string    // guarded by locker
 	greeting           string    // guarded by locker
 	sessionDeadline    time.Time // guarded by locker; persists across greeting/TLS resets
 	sessionDeadlineSet bool      // also remember an explicit disable, to clear old read deadlines
@@ -51,6 +51,7 @@ type Conn struct {
 	writeFailure error
 
 	session    Session
+	closed     bool // guarded by locker
 	locker     sync.Mutex
 	binarymime bool
 
@@ -270,10 +271,35 @@ func (c *Conn) logoutSession(session Session) error {
 	return session.Logout()
 }
 
-func (c *Conn) setSession(session Session) {
+// swapSession publishes a candidate before the old session is logged out, so
+// Close owns either the old session or the candidate, never an untracked gap.
+func (c *Conn) swapSession(session Session) (Session, bool) {
 	c.locker.Lock()
 	defer c.locker.Unlock()
+	if c.closed {
+		return nil, false
+	}
+	previous := c.session
 	c.session = session
+	return previous, true
+}
+
+func (c *Conn) isClosed() bool {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	return c.closed
+}
+
+// sameSession recognizes a reused comparable Session value (usually a pointer).
+// Uncomparable value implementations are valid sessions too, but have no such
+// identity; comparing their interface values must not panic the serve loop.
+func sameSession(a, b Session) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
 }
 
 // takeSession clears c.session and returns what it held, in one lock section.
@@ -293,6 +319,7 @@ func (c *Conn) Close() error {
 	// it: backends may call locked Conn accessors (Session, TLSConnectionState,
 	// ...) from within Logout, which would deadlock otherwise.
 	c.locker.Lock()
+	c.closed = true
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
@@ -332,20 +359,23 @@ func (c *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
 
 // Greeting returns the current greeting command: HELO, EHLO, or LHLO.
 // It is available inside Backend.NewSession and is empty before a greeting,
-// after STARTTLS, or if session creation failed.
+// after STARTTLS or XCLIENT, or if the first session could not be created. A refused
+// repeated greeting leaves the previous greeting intact.
 func (c *Conn) Greeting() string {
 	c.locker.Lock()
 	defer c.locker.Unlock()
 	return c.greeting
 }
 
-func (c *Conn) setGreeting(command string) {
+func (c *Conn) setGreeting(domain, command string) {
 	c.locker.Lock()
 	defer c.locker.Unlock()
-	c.greeting = command
+	c.helo, c.greeting = domain, command
 }
 
 func (c *Conn) Hostname() string {
+	c.locker.Lock()
+	defer c.locker.Unlock()
 	return c.helo
 }
 
@@ -417,21 +447,6 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
-	// RFC 5321 section 4.1.4: a refused EHLO leaves the server in the state it
-	// was in, so a repeated greeting is vetted before anything below discards
-	// the current session.
-	if gs, ok := c.Session().(GreetingSession); ok {
-		err := c.withCommandContext(func(ctx context.Context) error {
-			return gs.CheckGreeting(ctx, domain)
-		})
-		if err != nil {
-			c.writeError(451, EnhancedCode{4, 0, 0}, err)
-			return
-		}
-	}
-	// c.helo is populated before NewSession so
-	// NewSession can access it via Conn.Hostname.
-	c.helo = domain
 	greeting := "HELO"
 	if enhanced {
 		greeting = "EHLO"
@@ -439,33 +454,76 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 			greeting = "LHLO"
 		}
 	}
-	c.setGreeting(greeting)
-
-	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
-	// Take the session rather than read it: Conn.Close (via
-	// Server.Close/Shutdown on another goroutine) takes c.session
-	// concurrently, and only one of us may log it out.
-	if session := c.takeSession(); session != nil {
-		// RFC 5321: "... the SMTP server MUST clear all buffers
-		// and reset the state exactly as if a RSET command has been issued."
-
-		// Free session resources before resetting
-		if err := c.logoutSession(session); err != nil {
-			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
-		}
-		c.reset()
-	}
-
-	// Create new session (whether first EHLO or re-EHLO)
-	sess, err := c.server.Backend.NewSession(c)
-	if err != nil {
-		c.helo = ""
-		c.setGreeting("")
-		c.writeError(451, EnhancedCode{4, 0, 0}, err)
+	if c.isClosed() {
 		return
 	}
+	// While a BDAT transfer is open, leave its session and metadata alone.
+	// Refuse without touching the transfer; the client can finish it or issue
+	// RSET before greeting again.
+	c.locker.Lock()
+	transferring := c.bdatPipe != nil
+	c.locker.Unlock()
+	if transferring {
+		c.writeResponse(550, EnhancedCode{5, 5, 1}, "Finish or reset the chunked transfer before greeting again")
+		return
+	}
+	previous := c.Session()
+	if gs, ok := previous.(GreetingSession); ok {
+		err := c.withCommandContext(func(ctx context.Context) error {
+			return gs.CheckGreeting(ctx, domain)
+		})
+		if c.isClosed() {
+			return
+		}
+		if err != nil {
+			c.writeError(451, EnhancedCode{4, 0, 0}, err)
+			return
+		}
+	}
 
-	c.setSession(sess)
+	if previous != nil && c.didAuth {
+		// AUTH belongs to the SMTP session, not the mail transaction. A fresh
+		// backend session cannot inherit its SASL state (RFC 4954 section 4).
+		c.setGreeting(domain, greeting)
+		c.reset()
+	} else {
+		sess, err := c.newGreetingSession(domain, greeting)
+		if err != nil {
+			if !c.isClosed() {
+				c.writeError(451, EnhancedCode{4, 0, 0}, err)
+			}
+			return
+		}
+		old, installed := c.swapSession(sess)
+		if !installed {
+			// Close already took the previous session. A returned reference to
+			// it is not a new resource and must not be logged out a second time.
+			if !sameSession(sess, previous) {
+				sess.Logout()
+			}
+			return
+		}
+		reused := old != nil && sameSession(old, sess)
+		if old != nil && !reused {
+			// The serve goroutine can no longer Reset this detached session,
+			// and Close can take only the installed candidate. No callback lock
+			// is needed here; old.Logout may itself close the connection.
+			if err := old.Logout(); err != nil {
+				c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
+			}
+		}
+		if previous != nil {
+			if reused {
+				c.reset()
+			} else {
+				// A fresh candidate is already initialized by NewSession.
+				c.resetState()
+			}
+		}
+	}
+	if c.isClosed() {
+		return
+	}
 
 	if !enhanced {
 		// RFC 5321 §4.1.1.1: the first element of a HELO reply is the
@@ -548,6 +606,29 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	c.writeResponse(250, NoEnhancedCode, args...)
 }
 
+// newGreetingSession presents a proposed greeting to the constructor. Its
+// deadline updates belong to that proposal and commit only if it returns nil
+// error. The defer also restores the old metadata before handle recovers a panic.
+func (c *Conn) newGreetingSession(domain, command string) (Session, error) {
+	c.locker.Lock()
+	oldDomain, oldGreeting := c.helo, c.greeting
+	oldDeadline, oldDeadlineSet := c.sessionDeadline, c.sessionDeadlineSet
+	c.helo, c.greeting = domain, command
+	c.locker.Unlock()
+	accepted := false
+	defer func() {
+		if !accepted {
+			c.locker.Lock()
+			c.helo, c.greeting = oldDomain, oldGreeting
+			c.sessionDeadline, c.sessionDeadlineSet = oldDeadline, oldDeadlineSet
+			c.locker.Unlock()
+		}
+	}()
+	session, err := c.server.Backend.NewSession(c)
+	accepted = err == nil
+	return session, err
+}
+
 // helloReplyLine builds the first line of a HELO/EHLO reply. Per RFC 5321
 // §4.1.1.1 it must start with the server's domain; the greeting for the
 // client is appended as free text. When Server.Domain is unset, fall back to
@@ -561,7 +642,7 @@ func (c *Conn) helloReplyLine(clientDomain string) string {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
-	if c.helo == "" {
+	if c.Hostname() == "" {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
@@ -1091,7 +1172,7 @@ func checkNotifySet(values []DSNNotify) error {
 }
 
 func (c *Conn) handleAuth(arg string) {
-	if c.helo == "" {
+	if c.Hostname() == "" {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
@@ -1294,8 +1375,7 @@ func (c *Conn) handleStartTLS() {
 	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
 	}
-	c.helo = ""
-	c.setGreeting("")
+	c.setGreeting("", "")
 	c.didAuth = false
 	// RFC 3207 section 4.2: the server MUST discard any knowledge obtained from
 	// the client which was not obtained from the TLS negotiation itself.
@@ -1918,8 +1998,7 @@ func (c *Conn) handleXCLIENT(arg string) {
 	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
 	}
-	c.helo = ""
-	c.setGreeting("")
+	c.setGreeting("", "")
 	c.didAuth = false
 	c.reset()
 
@@ -2049,7 +2128,17 @@ func (c *Conn) reset() {
 	// the connection goroutine for the rest of the connection's life. That hangs
 	// every RSET and every message completion (handleData resets on return), and
 	// the goroutine, socket and session are never released.
+	if session := c.resetState(); session != nil {
+		c.resetSession(session)
+	}
+}
+
+// resetState clears the transaction without invoking a backend callback. A new
+// replacement session already has fresh backend state; a reused session instead
+// needs reset() to notify the backend as well.
+func (c *Conn) resetState() Session {
 	c.locker.Lock()
+	defer c.locker.Unlock()
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
@@ -2065,10 +2154,5 @@ func (c *Conn) reset() {
 	c.fromReceived = false
 	c.recipients = nil
 	c.binarymime = false
-	session := c.session
-	c.locker.Unlock()
-
-	if session != nil {
-		c.resetSession(session)
-	}
+	return c.session
 }
