@@ -149,12 +149,28 @@ func (p *parser) parseReversePath() (string, error) {
 	return p.parsePath()
 }
 
+func (p *parser) parseForwardPath() (string, error) {
+	if rest, ok := cutPrefixFold(p.s, "<postmaster>"); ok {
+		if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+			mbox := p.s[1 : 1+len("postmaster")]
+			p.s = rest
+			return mbox, nil
+		}
+	}
+	return p.parsePath()
+}
+
 func (p *parser) parsePath() (string, error) {
 	hasBracket := p.acceptByte('<')
 	if p.acceptByte('@') {
 		i := strings.IndexByte(p.s, ':')
 		if i < 0 {
 			return "", fmt.Errorf("malformed a-d-l")
+		}
+		for j := 0; j < i; j++ {
+			if p.s[j] <= 0x20 || p.s[j] == 0x7f {
+				return "", fmt.Errorf("malformed a-d-l")
+			}
 		}
 		p.s = p.s[i+1:]
 	}
@@ -166,6 +182,10 @@ func (p *parser) parsePath() (string, error) {
 		if err := p.expectByte('>'); err != nil {
 			return "", err
 		}
+	} else if strings.TrimSpace(p.s) != "" {
+		// Preserve legacy bare mailbox compatibility only without parameters.
+		// ESMTP parameters require the path's explicit closing delimiter.
+		return "", fmt.Errorf("path with parameters must be enclosed in angle brackets")
 	}
 	return mbox, nil
 }
@@ -194,6 +214,9 @@ func (p *parser) parseMailbox() (string, error) {
 		if ch == ' ' || ch == '\t' || ch == '>' {
 			break
 		}
+		if ch < 0x20 || ch == 0x7f {
+			return "", fmt.Errorf("malformed domain")
+		}
 		p.readByte()
 		sb.WriteByte(ch)
 	}
@@ -217,7 +240,7 @@ func (p *parser) parseLocalPart() (string, error) {
 			case '"':
 				return sb.String(), nil
 			}
-			if !ok {
+			if !ok || ch < 0x20 || ch == 0x7f {
 				return "", fmt.Errorf("malformed quoted-string")
 			}
 			sb.WriteByte(ch)
@@ -226,16 +249,27 @@ func (p *parser) parseLocalPart() (string, error) {
 		for {
 			ch, ok := p.peekByte()
 			if !ok {
-				return sb.String(), nil
+				break
 			}
 			switch ch {
-			case '@':
-				return sb.String(), nil
-			case '(', ')', '<', '>', '[', ']', ':', ';', '\\', ',', '"', ' ', '\t':
+			case '@', '>':
+				goto done
+			case '(', ')', '<', '[', ']', ':', ';', '\\', ',', '"', ' ', '\t':
+				return "", fmt.Errorf("malformed dot-string")
+			}
+			if ch < 0x20 || ch == 0x7f {
 				return "", fmt.Errorf("malformed dot-string")
 			}
 			p.readByte()
 			sb.WriteByte(ch)
 		}
+	done:
+		// Leading, trailing and consecutive dots are not a valid RFC 5321
+		// Dot-string, but they are accepted on purpose, as Postfix does:
+		// older Japanese carrier addresses (docomo, au/ezweb, SoftBank)
+		// still use them in large numbers, and refusing them at MAIL FROM
+		// bounces their mail. Every other refusal
+		// above stands.
+		return sb.String(), nil
 	}
 }

@@ -30,10 +30,13 @@ const errThreshold = 3
 const maxAuthFailures = 3
 
 type Conn struct {
-	conn   net.Conn
-	text   *textproto.Conn
-	server *Server
-	helo   string
+	conn               net.Conn
+	text               *textproto.Conn
+	server             *Server
+	helo               string
+	greeting           string    // guarded by locker
+	sessionDeadline    time.Time // guarded by locker; persists across greeting/TLS resets
+	sessionDeadlineSet bool      // also remember an explicit disable, to clear old read deadlines
 
 	// Number of errors witnessed on this connection
 	errCount int
@@ -273,6 +276,18 @@ func (c *Conn) setSession(session Session) {
 	c.session = session
 }
 
+// takeSession clears c.session and returns what it held, in one lock section.
+// Whoever takes a session logs it out, so a session is logged out exactly once
+// even when Conn.Close (via Server.Close/Shutdown on another goroutine) races
+// a command that replaces the session.
+func (c *Conn) takeSession() Session {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	session := c.session
+	c.session = nil
+	return session
+}
+
 func (c *Conn) Close() error {
 	// Take what we need under the lock, but call Logout and Close outside of
 	// it: backends may call locked Conn accessors (Session, TLSConnectionState,
@@ -286,6 +301,7 @@ func (c *Conn) Close() error {
 		c.bdatCtxCancel()
 		c.bdatCtxCancel = nil
 	}
+	// Take the session as takeSession does, inside this lock section.
 	session := c.session
 	c.session = nil
 	conn := c.conn
@@ -312,6 +328,21 @@ func (c *Conn) TLSConnectionState() (state tls.ConnectionState, ok bool) {
 		return
 	}
 	return tc.ConnectionState(), true
+}
+
+// Greeting returns the current greeting command: HELO, EHLO, or LHLO.
+// It is available inside Backend.NewSession and is empty before a greeting,
+// after STARTTLS, or if session creation failed.
+func (c *Conn) Greeting() string {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	return c.greeting
+}
+
+func (c *Conn) setGreeting(command string) {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.greeting = command
 }
 
 func (c *Conn) Hostname() string {
@@ -386,15 +417,35 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
+	// RFC 5321 section 4.1.4: a refused EHLO leaves the server in the state it
+	// was in, so a repeated greeting is vetted before anything below discards
+	// the current session.
+	if gs, ok := c.Session().(GreetingSession); ok {
+		err := c.withCommandContext(func(ctx context.Context) error {
+			return gs.CheckGreeting(ctx, domain)
+		})
+		if err != nil {
+			c.writeError(451, EnhancedCode{4, 0, 0}, err)
+			return
+		}
+	}
 	// c.helo is populated before NewSession so
 	// NewSession can access it via Conn.Hostname.
 	c.helo = domain
+	greeting := "HELO"
+	if enhanced {
+		greeting = "EHLO"
+		if c.server.LMTP {
+			greeting = "LHLO"
+		}
+	}
+	c.setGreeting(greeting)
 
 	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
-	// Access the session through the locked accessors: Conn.Close (via
-	// Server.Close/Shutdown on another goroutine) writes c.session
-	// concurrently.
-	if session := c.Session(); session != nil {
+	// Take the session rather than read it: Conn.Close (via
+	// Server.Close/Shutdown on another goroutine) takes c.session
+	// concurrently, and only one of us may log it out.
+	if session := c.takeSession(); session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
 
@@ -402,7 +453,6 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		if err := c.logoutSession(session); err != nil {
 			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
 		}
-		c.setSession(nil)
 		c.reset()
 	}
 
@@ -410,6 +460,7 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	sess, err := c.server.Backend.NewSession(c)
 	if err != nil {
 		c.helo = ""
+		c.setGreeting("")
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -890,9 +941,9 @@ func (c *Conn) handleRcpt(arg string) {
 	}
 
 	p := parser{s: strings.TrimSpace(arg)}
-	recipient, err := p.parsePath()
+	recipient, err := p.parseForwardPath()
 	if err != nil {
-		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
+		c.writeResponse(501, EnhancedCode{5, 1, 3}, "Was expecting RCPT arg syntax of TO:<address>")
 		return
 	}
 
@@ -1048,15 +1099,27 @@ func (c *Conn) handleAuth(arg string) {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Already authenticated")
 		return
 	}
-
-	parts := strings.Fields(arg)
-	if len(parts) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 4}, "Missing parameter")
+	if c.fromReceived {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Error: AUTH not permitted during mail transaction")
 		return
 	}
 
+	parts := strings.Fields(arg)
+	if len(parts) == 0 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing parameter")
+		return
+	}
+	if len(parts) > 2 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Syntax error in parameters or arguments")
+		return
+	}
+
+	// RFC 4954 §4: a mechanism that requires an encryption layer is invalid
+	// here, so reject it with 504 5.5.4. The 538 5.7.11 reply is kept in §6
+	// for historical purposes only and is deprecated by §15. EHLO does not
+	// advertise AUTH until it is allowed, as §6 asks.
 	if !c.authAllowed() {
-		c.writeResponse(523, EnhancedCode{5, 7, 10}, "TLS is required")
+		c.writeResponse(504, EnhancedCode{5, 5, 4}, "Mechanism requires an encrypted connection")
 		return
 	}
 
@@ -1068,7 +1131,7 @@ func (c *Conn) handleAuth(arg string) {
 		var err error
 		ir, err = decodeSASLResponse(parts[1])
 		if err != nil {
-			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
+			c.authFailed(501, EnhancedCode{5, 5, 2}, errors.New("Invalid base64 data"))
 			return
 		}
 	}
@@ -1117,7 +1180,7 @@ func (c *Conn) handleAuth(arg string) {
 
 		response, err = decodeSASLResponse(encoded)
 		if err != nil {
-			c.authFailed(454, EnhancedCode{4, 7, 0}, errors.New("Invalid base64 data"))
+			c.authFailed(501, EnhancedCode{5, 5, 2}, errors.New("Invalid base64 data"))
 			return
 		}
 	}
@@ -1228,11 +1291,11 @@ func (c *Conn) handleStartTLS() {
 	// This is different from just calling reset() since we want the Backend to
 	// be able to see the information about TLS connection in the
 	// ConnectionState object passed to it.
-	if session := c.Session(); session != nil {
+	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
-		c.setSession(nil)
 	}
 	c.helo = ""
+	c.setGreeting("")
 	c.didAuth = false
 	// RFC 3207 section 4.2: the server MUST discard any knowledge obtained from
 	// the client which was not obtained from the TLS negotiation itself.
@@ -1649,8 +1712,15 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 // (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
 // chunk following its command — do not count toward the limit.
 func (c *Conn) readLine() (string, error) {
+	deadline, configured := c.getSessionDeadline()
 	if c.server.ReadTimeout != 0 {
-		if err := c.conn.SetReadDeadline(time.Now().Add(c.server.ReadTimeout)); err != nil {
+		idleDeadline := time.Now().Add(c.server.ReadTimeout)
+		if deadline.IsZero() || idleDeadline.Before(deadline) {
+			deadline = idleDeadline
+		}
+	}
+	if configured || !deadline.IsZero() {
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return "", err
 		}
 	}
@@ -1845,11 +1915,11 @@ func (c *Conn) handleXCLIENT(arg string) {
 
 	// Per XCLIENT spec, we must reset the session state and issue a new
 	// greeting. This is similar to what we do for STARTTLS.
-	if session := c.Session(); session != nil {
+	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
-		c.setSession(nil)
 	}
 	c.helo = ""
+	c.setGreeting("")
 	c.didAuth = false
 	c.reset()
 
