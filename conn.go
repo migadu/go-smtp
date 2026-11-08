@@ -276,6 +276,18 @@ func (c *Conn) setSession(session Session) {
 	c.session = session
 }
 
+// takeSession clears c.session and returns what it held, in one lock section.
+// Whoever takes a session logs it out, so a session is logged out exactly once
+// even when Conn.Close (via Server.Close/Shutdown on another goroutine) races
+// a command that replaces the session.
+func (c *Conn) takeSession() Session {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	session := c.session
+	c.session = nil
+	return session
+}
+
 func (c *Conn) Close() error {
 	// Take what we need under the lock, but call Logout and Close outside of
 	// it: backends may call locked Conn accessors (Session, TLSConnectionState,
@@ -289,6 +301,7 @@ func (c *Conn) Close() error {
 		c.bdatCtxCancel()
 		c.bdatCtxCancel = nil
 	}
+	// Take the session as takeSession does, inside this lock section.
 	session := c.session
 	c.session = nil
 	conn := c.conn
@@ -429,10 +442,10 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	c.setGreeting(greeting)
 
 	// RFC 5321: "An EHLO command MAY be issued by a client later in the session"
-	// Access the session through the locked accessors: Conn.Close (via
-	// Server.Close/Shutdown on another goroutine) writes c.session
-	// concurrently.
-	if session := c.Session(); session != nil {
+	// Take the session rather than read it: Conn.Close (via
+	// Server.Close/Shutdown on another goroutine) takes c.session
+	// concurrently, and only one of us may log it out.
+	if session := c.takeSession(); session != nil {
 		// RFC 5321: "... the SMTP server MUST clear all buffers
 		// and reset the state exactly as if a RSET command has been issued."
 
@@ -440,7 +453,6 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		if err := c.logoutSession(session); err != nil {
 			c.server.ErrorLog.Printf("Failed to logout session on re-EHLO: %v", err)
 		}
-		c.setSession(nil)
 		c.reset()
 	}
 
@@ -1275,9 +1287,8 @@ func (c *Conn) handleStartTLS() {
 	// This is different from just calling reset() since we want the Backend to
 	// be able to see the information about TLS connection in the
 	// ConnectionState object passed to it.
-	if session := c.Session(); session != nil {
+	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
-		c.setSession(nil)
 	}
 	c.helo = ""
 	c.setGreeting("")
@@ -1900,9 +1911,8 @@ func (c *Conn) handleXCLIENT(arg string) {
 
 	// Per XCLIENT spec, we must reset the session state and issue a new
 	// greeting. This is similar to what we do for STARTTLS.
-	if session := c.Session(); session != nil {
+	if session := c.takeSession(); session != nil {
 		c.logoutSession(session)
-		c.setSession(nil)
 	}
 	c.helo = ""
 	c.setGreeting("")
