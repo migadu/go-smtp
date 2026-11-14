@@ -642,8 +642,11 @@ func (c *Conn) helloReplyLine(clientDomain string) string {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
+	// Out of sequence, not unimplemented: 503. RFC 5321 section 4.1.1.1: "a
+	// client MUST issue HELO or EHLO before starting a mail transaction";
+	// section 4.3.2 lists 503, not 502, among the error replies to MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.bdatPipe != nil {
@@ -1006,8 +1009,11 @@ func isPrintableASCII(val string) bool {
 
 // MAIL state -> waiting for RCPTs followed by DATA
 func (c *Conn) handleRcpt(arg string) {
+	// RFC 5321 section 3.3: "If a RCPT command appears without a previous
+	// MAIL command, the server MUST return a 503 "Bad sequence of commands"
+	// response."
 	if !c.fromReceived {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
 	if c.bdatPipe != nil {
@@ -1172,8 +1178,9 @@ func checkNotifySet(values []DSNNotify) error {
 }
 
 func (c *Conn) handleAuth(arg string) {
+	// AUTH is negotiated by EHLO; before it, a bad sequence (503) as for MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.didAuth {
@@ -1398,8 +1405,10 @@ func (c *Conn) handleData(arg string) {
 		return
 	}
 
+	// RFC 5321 section 3.3 allows 503 or 554 for DATA without MAIL or an
+	// accepted RCPT; RFC 2033 section 4.2 requires 503 in LMTP.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1433,8 +1442,10 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
+	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
+	// which ended the transaction: RFC 3030 section 2 requires 503 for it.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 

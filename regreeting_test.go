@@ -181,7 +181,7 @@ func TestNewSessionReusesSessionAndResetsOnlyOnSuccess(t *testing.T) {
 			if sess.resets.Load() != before+1 || sess.conn.Hostname() != "accepted.example" || sess.conn.Greeting() != command {
 				t.Fatal("accepted re-greeting did not reset the transaction or update metadata")
 			}
-			send("DATA", "502")
+			send("DATA", "503")
 			send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "235")
 			send("QUIT", "221")
 			if scanner.Scan() {
