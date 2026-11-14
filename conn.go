@@ -684,18 +684,18 @@ func (c *Conn) handleMail(arg string) {
 	for key, value := range args {
 		switch key {
 		case "SIZE":
-			size, err := strconv.ParseUint(value, 10, 32)
+			size, tooLarge, err := parseSize(value)
 			if err != nil {
 				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse SIZE as an integer")
 				return
 			}
 
-			if c.server.MaxMessageBytes > 0 && int64(size) > c.server.MaxMessageBytes {
+			if tooLarge || c.server.MaxMessageBytes > 0 && size > c.server.MaxMessageBytes {
 				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 				return
 			}
 
-			opts.Size = int64(size)
+			opts.Size = size
 		case "SMTPUTF8":
 			if !c.server.EnableSMTPUTF8 {
 				c.writeResponse(504, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
@@ -1447,18 +1447,29 @@ func (c *Conn) handleBdat(arg string) {
 		last = true
 	}
 
-	// ParseUint instead of Atoi so we will not accept negative values.
-	size, err := strconv.ParseUint(args[0], 10, 32)
+	size, tooLarge, err := parseSize(args[0])
 	if err != nil {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed size argument")
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
+	if tooLarge {
+		// RFC 3030 section 2 has a refused chunk discarded so that the next
+		// command can be read; a chunk this large cannot be, and the rest of
+		// the connection would be read as commands.
+		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded, closing connection")
+		c.Close()
+		return
+	}
+
+	// Compared without adding to bytesReceived, which an accepted chunk
+	// never takes past the limit, so that a size near the largest int64
+	// cannot overflow the check.
+	if c.server.MaxMessageBytes != 0 && size > c.server.MaxMessageBytes-c.bytesReceived {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
-		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
+		io.Copy(io.Discard, io.LimitReader(c.text.R, size))
 
 		c.reset()
 		return
@@ -1521,7 +1532,7 @@ func (c *Conn) handleBdat(arg string) {
 		}()
 	}
 
-	chunk := io.LimitReader(c.text.R, int64(size))
+	chunk := io.LimitReader(c.text.R, size)
 	_, err = io.Copy(c.bdatPipe, chunk)
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
@@ -1538,7 +1549,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	c.bytesReceived += int64(size)
+	c.bytesReceived += size
 
 	if last {
 		c.bdatPipe.Close()
