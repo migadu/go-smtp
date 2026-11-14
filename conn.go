@@ -1389,12 +1389,14 @@ func (c *Conn) handleData(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "DATA command should not have any arguments")
 		return
 	}
+	// RFC 3030 sections 2 and 3: DATA after a BDAT of the current
+	// transaction, or after MAIL BODY=BINARYMIME, MUST get 503.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
 		return
 	}
 	if c.binarymime {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
 		return
 	}
 
