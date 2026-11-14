@@ -36,6 +36,8 @@ func TestServer_MAILSizeBeyond32Bits(t *testing.T) {
 		{"not a number", 50 << 20, "rabbit", "501 5.5.4 "},
 		{"negative", 0, "-1", "501 5.5.4 "},
 		{"signed", 0, "+1", "501 5.5.4 "},
+		{"digits beyond uint64, then a letter", 50 << 20, "99999999999999999999x", "501 5.5.4 "},
+		{"digits beyond int64, then a sign", 0, "9223372036854775808-", "501 5.5.4 "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			be, s, c, scanner, _ := testServerEhlo(t, func(s *smtp.Server) {
@@ -139,6 +141,26 @@ func TestServer_BDATChunkBeyondInt64(t *testing.T) {
 				t.Fatal("Connection left open after an unreadable chunk")
 			}
 		})
+	}
+}
+
+// A size argument that is not all digits is a syntax error, however many
+// digits precede the first other character: it is not a valid oversized
+// chunk, and the connection stays usable.
+func TestServer_BDATMalformedOverlongSize(t *testing.T) {
+	_, s, c, scanner := testBDATTransaction(t, 0)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "BDAT 99999999999999999999x\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 5.5.4 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response:", scanner.Text())
 	}
 }
 
