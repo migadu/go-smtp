@@ -396,3 +396,28 @@ func TestBDATContentErrorIsTemporary(t *testing.T) {
 		}
 	}
 }
+
+// A message over MaxMessageBytes is refused and the rest of it consumed up to
+// the end-of-data marker, in LMTP as in SMTP: what follows the limit is still
+// message content, not commands.
+func TestDataOverLimitIsConsumed(t *testing.T) {
+	for _, mode := range []transferMode{{name: "DATA"}, {name: "LMTP DATA", lmtp: true}} {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			tt := startTransfer(t, mode, func(s *smtp.Server) { s.MaxMessageBytes = 100 })
+			tt.begin(0)
+			io.WriteString(tt.conn, strings.Repeat(trickleLine, 10))
+			tt.end()
+
+			if r := tt.result(); r.err == nil {
+				t.Errorf("backend read %d bytes of a message over the limit without an error", r.n)
+			}
+			if reply := tt.reply(); !strings.HasPrefix(reply, "552 ") {
+				t.Errorf("message over the limit answered %q", reply)
+			}
+			io.WriteString(tt.conn, "NOOP\r\n")
+			readGreetingReply(t, tt.scanner, "250")
+		})
+	}
+}
