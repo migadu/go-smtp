@@ -1428,24 +1428,6 @@ func (c *Conn) handleBdat(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing chunk size argument")
 		return
 	}
-	if len(args) > 2 {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Too many arguments")
-		return
-	}
-
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
-		return
-	}
-
-	last := false
-	if len(args) == 2 {
-		if !strings.EqualFold(args[1], "LAST") {
-			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
-			return
-		}
-		last = true
-	}
 
 	// ParseUint instead of Atoi so we will not accept negative values.
 	size, err := strconv.ParseUint(args[0], 10, 32)
@@ -1454,12 +1436,38 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
-		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
-
-		// Discard chunk itself without passing it to backend.
+	// The client sends the chunk right behind the command line, whatever the
+	// reply, so a refused chunk is read and dropped before the reply; left in
+	// the input, it would be read as commands. RFC 3030 section 2: "If a
+	// failure occurs after a BDAT command is received, the receiver-SMTP MUST
+	// accept and discard the associated message data before sending the
+	// appropriate 5XX or 4XX code."
+	refuse := func(code int, enhCode EnhancedCode, text string) {
 		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
+		c.writeResponse(code, enhCode, text)
+	}
 
+	if len(args) > 2 {
+		refuse(501, EnhancedCode{5, 5, 4}, "Too many arguments")
+		return
+	}
+
+	last := false
+	if len(args) == 2 {
+		if !strings.EqualFold(args[1], "LAST") {
+			refuse(501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
+			return
+		}
+		last = true
+	}
+
+	if !c.fromReceived || len(c.recipients) == 0 {
+		refuse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		return
+	}
+
+	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
+		refuse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 		c.reset()
 		return
 	}
