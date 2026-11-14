@@ -1433,11 +1433,6 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
-		return
-	}
-
 	last := false
 	if len(args) == 2 {
 		if !strings.EqualFold(args[1], "LAST") {
@@ -1451,6 +1446,21 @@ func (c *Conn) handleBdat(arg string) {
 	size, err := strconv.ParseUint(args[0], 10, 32)
 	if err != nil {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+		return
+	}
+
+	if !c.fromReceived || len(c.recipients) == 0 {
+		// RFC 2033 section 4.3: "If there were no previously successful RCPT
+		// commands in the mail transaction, then the BDAT LAST command
+		// returns zero replies." A reply would be one more than the client
+		// counts. The transaction ends with no message for anyone: the chunk
+		// is read and dropped.
+		if c.server.LMTP && c.fromReceived && last {
+			io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
+			c.reset()
+			return
+		}
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
