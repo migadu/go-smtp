@@ -61,9 +61,9 @@ func newDataReader(c *Conn) *dataReader {
 		r: c.text.R,
 	}
 
-	if c.server.MaxMessageBytes > 0 {
+	if limit := c.server.maxMessageBytes(); limit > 0 {
 		dr.limited = true
-		dr.n = int64(c.server.MaxMessageBytes)
+		dr.n = limit
 	}
 
 	return dr
