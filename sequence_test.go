@@ -52,8 +52,14 @@ func TestServer_BadSequenceReplies(t *testing.T) {
 
 	for _, lmtp := range []bool{false, true} {
 		greet := step{"EHLO client.example.org", "250"}
+		// In LMTP a BDAT LAST inside a transaction without an accepted
+		// recipient is not refused: RFC 2033 section 4.3, "If there were no
+		// previously successful RCPT commands in the mail transaction, then
+		// the BDAT LAST command returns zero replies". A non-final chunk is.
+		bdatNoRcpt := "BDAT 0 LAST"
 		if lmtp {
 			greet = step{"LHLO client.example.org", "250"}
+			bdatNoRcpt = "BDAT 0"
 		}
 		for _, tc := range []struct {
 			name   string
@@ -67,8 +73,8 @@ func TestServer_BadSequenceReplies(t *testing.T) {
 			{"DATA without RCPT", []step{greet, mail}, "DATA"},
 			{"DATA after a refused RCPT", []step{greet, mail, refused}, "DATA"},
 			{"BDAT without MAIL", []step{greet}, "BDAT 0 LAST"},
-			{"BDAT without RCPT", []step{greet, mail}, "BDAT 0 LAST"},
-			{"BDAT after a refused RCPT", []step{greet, mail, refused}, "BDAT 0 LAST"},
+			{"BDAT without RCPT", []step{greet, mail}, bdatNoRcpt},
+			{"BDAT after a refused RCPT", []step{greet, mail, refused}, bdatNoRcpt},
 			{"BDAT after BDAT LAST", []step{greet, mail, rcpt, bdatLast}, "BDAT 0 LAST"},
 		} {
 			t.Run(fmt.Sprintf("lmtp=%v/%s", lmtp, tc.name), func(t *testing.T) {
