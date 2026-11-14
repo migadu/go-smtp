@@ -37,28 +37,46 @@ func (s refuseRcptSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptO
 // in the mail transaction, the DATA command MUST fail with a 503 reply code."
 // RFC 3030 section 2: "Any BDAT command sent after the BDAT LAST is illegal
 // and MUST be replied to with a 503 "Bad sequence of commands" reply code."
+//
+// The same holds for MAIL and RCPT sent while a BDAT transfer is under way
+// (RFC 3030 section 2: "After all MAIL and RCPT responses are collected and
+// processed, the message is sent using a series of BDAT commands"), and for
+// MAIL and AUTH before the greeting (RFC 5321 section 4.1.1.1: "a client MUST
+// issue HELO or EHLO before starting a mail transaction"). RFC 5321 section
+// 4.1.4: "If the commands in a transaction are out of order to the degree
+// that they cannot be processed by the server, a 503 failure reply MUST be
+// returned", and section 4.3.2 lists 503, not 502, for MAIL and RCPT.
 func TestServer_BadSequenceReplies(t *testing.T) {
 	type step struct{ cmd, code string }
 	mail := step{"MAIL FROM:<sender@example.com>", "250"}
 	rcpt := step{"RCPT TO:<recipient@example.com>", "250"}
 	refused := step{"RCPT TO:<refused@example.com>", "550"}
 	// The chunk is "Hello" and the CRLF written after each step.
+	bdatChunk := step{"BDAT 7\r\nHello", "250"}
 	bdatLast := step{"BDAT 7 LAST\r\nHello", "250"}
 
 	for _, lmtp := range []bool{false, true} {
+		greet := step{"EHLO client.example.org", "250"}
+		if lmtp {
+			greet = step{"LHLO client.example.org", "250"}
+		}
 		for _, tc := range []struct {
 			name   string
 			before []step
 			cmd    string
 		}{
-			{"RCPT without MAIL", nil, "RCPT TO:<recipient@example.com>"},
-			{"DATA without MAIL", nil, "DATA"},
-			{"DATA without RCPT", []step{mail}, "DATA"},
-			{"DATA after a refused RCPT", []step{mail, refused}, "DATA"},
-			{"BDAT without MAIL", nil, "BDAT 0 LAST"},
-			{"BDAT without RCPT", []step{mail}, "BDAT 0 LAST"},
-			{"BDAT after a refused RCPT", []step{mail, refused}, "BDAT 0 LAST"},
-			{"BDAT after BDAT LAST", []step{mail, rcpt, bdatLast}, "BDAT 0 LAST"},
+			{"MAIL before the greeting", nil, "MAIL FROM:<sender@example.com>"},
+			{"AUTH before the greeting", nil, "AUTH PLAIN"},
+			{"RCPT without MAIL", []step{greet}, "RCPT TO:<recipient@example.com>"},
+			{"DATA without MAIL", []step{greet}, "DATA"},
+			{"DATA without RCPT", []step{greet, mail}, "DATA"},
+			{"DATA after a refused RCPT", []step{greet, mail, refused}, "DATA"},
+			{"BDAT without MAIL", []step{greet}, "BDAT 0 LAST"},
+			{"BDAT without RCPT", []step{greet, mail}, "BDAT 0 LAST"},
+			{"BDAT after a refused RCPT", []step{greet, mail, refused}, "BDAT 0 LAST"},
+			{"BDAT after BDAT LAST", []step{greet, mail, rcpt, bdatLast}, "BDAT 0 LAST"},
+			{"MAIL during BDAT", []step{greet, mail, rcpt, bdatChunk}, "MAIL FROM:<sender@example.com>"},
+			{"RCPT during BDAT", []step{greet, mail, rcpt, bdatChunk}, "RCPT TO:<recipient@example.com>"},
 		} {
 			t.Run(fmt.Sprintf("lmtp=%v/%s", lmtp, tc.name), func(t *testing.T) {
 				_, s, c, scanner := testServer(t, func(s *smtp.Server) {
@@ -77,11 +95,7 @@ func TestServer_BadSequenceReplies(t *testing.T) {
 				c.SetDeadline(time.Now().Add(5 * time.Second))
 
 				readGreetingReply(t, scanner, "220")
-				greeting := "EHLO"
-				if lmtp {
-					greeting = "LHLO"
-				}
-				for _, st := range append([]step{{greeting + " client.example.org", "250"}}, tc.before...) {
+				for _, st := range tc.before {
 					io.WriteString(c, st.cmd+"\r\n")
 					readGreetingReply(t, scanner, st.code)
 				}
