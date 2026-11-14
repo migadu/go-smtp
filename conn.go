@@ -644,15 +644,13 @@ func (c *Conn) helloReplyLine(clientDomain string) string {
 func (c *Conn) handleMail(arg string) {
 	// Out of sequence, not unimplemented: 503. RFC 5321 section 4.1.1.1: "a
 	// client MUST issue HELO or EHLO before starting a mail transaction";
-	// section 4.1.4: "If the commands in a transaction are out of order to
-	// the degree that they cannot be processed by the server, a 503 failure
-	// reply MUST be returned".
+	// section 4.3.2 lists 503, not 502, among the error replies to MAIL.
 	if c.Hostname() == "" {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.bdatPipe != nil {
-		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
 		return
 	}
 	// RFC 5321 section 4.1.1.2: MAIL is only permitted when there is no
@@ -1018,10 +1016,8 @@ func (c *Conn) handleRcpt(arg string) {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
-	// RFC 3030 section 2: "After all MAIL and RCPT responses are collected
-	// and processed, the message is sent using a series of BDAT commands."
 	if c.bdatPipe != nil {
-		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
 
