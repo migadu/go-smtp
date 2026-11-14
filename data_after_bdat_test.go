@@ -70,6 +70,51 @@ func TestServer_DataInBDATTransaction(t *testing.T) {
 	}
 }
 
+// MAIL and RCPT are out of sequence once BDAT has started the message
+// transfer, so they get 503 like DATA does.
+//
+// RFC 5321 section 4.1.4: "a mail transaction consists of a transaction
+// beginning command, one or more RCPT commands, and a DATA command, in that
+// order. [...] MAIL (or SEND, SOML, or SAML) MUST NOT be sent if a mail
+// transaction is already open". RFC 3030 section 2 sends the BDAT chunks
+// "After all MAIL and RCPT responses are collected and processed". The
+// command-reply sequences of RFC 5321 section 4.3.2 list 503 for MAIL and
+// RCPT, and 502 for neither.
+func TestServer_MailRcptInBDATTransaction(t *testing.T) {
+	for _, lmtp := range []bool{false, true} {
+		name := "SMTP"
+		if lmtp {
+			name = "LMTP"
+		}
+		t.Run(name, func(t *testing.T) {
+			var (
+				s       *smtp.Server
+				c       net.Conn
+				scanner *bufio.Scanner
+			)
+			if lmtp {
+				_, s, c, scanner = testServerGreetedLMTP(t, func(s *smtp.Server) { s.LMTP = true })
+				sendLHLO(t, scanner, c)
+			} else {
+				_, s, c, scanner, _ = testServerEhlo(t)
+			}
+			defer s.Close()
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(5 * time.Second))
+
+			dataSeqExpect(t, c, scanner, "MAIL FROM:<sender@example.org>", "250 ")
+			dataSeqExpect(t, c, scanner, "RCPT TO:<rcpt@example.com>", "250 ")
+			// The chunk is "Hello\r\n"; dataSeqExpect adds the CRLF.
+			dataSeqExpect(t, c, scanner, "BDAT 7\r\nHello", "250 ")
+
+			dataSeqExpect(t, c, scanner, "MAIL FROM:<other@example.org>", "503 5.5.1 ")
+			dataSeqExpect(t, c, scanner, "RCPT TO:<other@example.com>", "503 5.5.1 ")
+
+			dataSeqExpect(t, c, scanner, "RSET", "250 ")
+		})
+	}
+}
+
 func dataSeqExpect(t *testing.T, c net.Conn, scanner *bufio.Scanner, cmd, reply string) {
 	t.Helper()
 	io.WriteString(c, cmd+"\r\n")
