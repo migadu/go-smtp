@@ -1420,6 +1420,9 @@ func (c *Conn) handleData(arg string) {
 	r.limited = false
 	io.Copy(io.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
+	if err := r.r.err; err != nil { // the content could not be read to its end
+		c.endAfterContentError(err)
+	}
 }
 
 func (c *Conn) handleBdat(arg string) {
@@ -1458,9 +1461,13 @@ func (c *Conn) handleBdat(arg string) {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
-		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
+		cr := newContentReader(c)
+		io.Copy(io.Discard, io.LimitReader(cr, int64(size)))
 
 		c.reset()
+		if cr.err != nil {
+			c.endAfterContentError(cr.err)
+		}
 		return
 	}
 
@@ -1521,7 +1528,8 @@ func (c *Conn) handleBdat(arg string) {
 		}()
 	}
 
-	chunk := io.LimitReader(c.text.R, int64(size))
+	cr := newContentReader(c)
+	chunk := io.LimitReader(cr, int64(size))
 	_, err = io.Copy(c.bdatPipe, chunk)
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
@@ -1532,6 +1540,8 @@ func (c *Conn) handleBdat(arg string) {
 
 		if err == errPanic {
 			c.Close()
+		} else if cr.err != nil {
+			c.endAfterContentError(cr.err)
 		}
 
 		c.reset()
@@ -1699,6 +1709,8 @@ func (c *Conn) handleDataLMTP() {
 	// should be closed.
 	if !<-done {
 		c.Close()
+	} else if err := r.r.err; err != nil {
+		c.endAfterContentError(err)
 	}
 }
 
@@ -1788,21 +1800,48 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 	}
 }
 
-// Reads a line of input, enforcing Server.MaxLineLength on the line itself
-// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
-// chunk following its command — do not count toward the limit.
-func (c *Conn) readLine() (string, error) {
+// armReadDeadline sets the deadline for the next read of client input:
+// ReadTimeout from now, capped by the session deadline and by limit, if
+// non-zero. When nothing bounds the read it leaves the connection's deadline
+// alone, unless one may have been set before (a session deadline since
+// disabled, or a DataTimeout), which it clears.
+func (c *Conn) armReadDeadline(limit time.Time) error {
 	deadline, configured := c.getSessionDeadline()
+	if !limit.IsZero() && (deadline.IsZero() || limit.Before(deadline)) {
+		deadline = limit
+	}
 	if c.server.ReadTimeout != 0 {
 		idleDeadline := time.Now().Add(c.server.ReadTimeout)
 		if deadline.IsZero() || idleDeadline.Before(deadline) {
 			deadline = idleDeadline
 		}
 	}
-	if configured || !deadline.IsZero() {
-		if err := c.conn.SetReadDeadline(deadline); err != nil {
-			return "", err
+	if configured || !deadline.IsZero() || c.server.DataTimeout != 0 {
+		return c.conn.SetReadDeadline(deadline)
+	}
+	return nil
+}
+
+// endAfterContentError closes the connection once message content could not be
+// read to its end, after the transaction's reply has been written. The rest of
+// the client's input can no longer be told apart from commands, and RFC 5321
+// section 3.8 lets the server close "after a timeout ... occurs waiting for the
+// client to send a command or data".
+func (c *Conn) endAfterContentError(err error) {
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		if h := c.server.OnTimeout; h != nil {
+			h()
 		}
+	}
+	c.Close()
+}
+
+// Reads a line of input, enforcing Server.MaxLineLength on the line itself
+// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
+// chunk following its command — do not count toward the limit.
+func (c *Conn) readLine() (string, error) {
+	if err := c.armReadDeadline(time.Time{}); err != nil {
+		return "", err
 	}
 
 	var line []byte

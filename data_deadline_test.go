@@ -271,6 +271,73 @@ func TestSessionDeadlineCapsContentRead(t *testing.T) {
 	}
 }
 
+// DataTimeout bounds one transfer however steadily the client sends, and
+// ends the connection as any other content timeout does.
+func TestDataTimeoutBoundsTransfer(t *testing.T) {
+	for _, mode := range transferModes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			var timeouts atomic.Int32
+			tt := startTransfer(t, mode, func(s *smtp.Server) {
+				s.ReadTimeout = time.Minute
+				s.DataTimeout = 300 * time.Millisecond
+				s.OnTimeout = func() { timeouts.Add(1) }
+			})
+			tt.begin(40 * len(trickleLine))
+			go trickle(tt.conn, 40, 50*time.Millisecond)
+
+			start := time.Now()
+			if r := tt.result(); !tt.failed(r) {
+				t.Errorf("backend read error = %v, want the transfer to fail", r.err)
+			}
+			if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+				t.Errorf("transfer ran %v with a DataTimeout of 300ms", elapsed)
+			}
+			if reply := tt.reply(); strings.HasPrefix(reply, "2") {
+				t.Errorf("transfer cut off by DataTimeout answered %q", reply)
+			}
+			if tt.scanner.Scan() {
+				t.Errorf("connection kept open after DataTimeout: read %q", tt.scanner.Text())
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for timeouts.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if n := timeouts.Load(); n != 1 {
+				t.Errorf("OnTimeout called %d times, want 1", n)
+			}
+		})
+	}
+}
+
+// The deadline DataTimeout sets ends with its transfer, also when no
+// ReadTimeout replaces it: the next command may arrive later than that.
+func TestDataTimeoutEndsWithTransfer(t *testing.T) {
+	for _, mode := range transferModes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			tt := startTransfer(t, mode, func(s *smtp.Server) {
+				s.ReadTimeout = 0
+				s.DataTimeout = 200 * time.Millisecond
+			})
+			tt.begin(len(trickleLine))
+			io.WriteString(tt.conn, trickleLine)
+			tt.end()
+			if r := tt.result(); r.err != nil {
+				t.Fatalf("backend read error = %v", r.err)
+			}
+			if reply := tt.reply(); !strings.HasPrefix(reply, "250 ") {
+				t.Fatalf("transfer answered %q", reply)
+			}
+			time.Sleep(300 * time.Millisecond)
+			io.WriteString(tt.conn, "NOOP\r\n")
+			readGreetingReply(t, tt.scanner, "250")
+		})
+	}
+}
+
 func isTimeout(err error) bool {
 	for err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
