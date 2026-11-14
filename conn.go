@@ -1423,44 +1423,60 @@ func (c *Conn) handleData(arg string) {
 }
 
 func (c *Conn) handleBdat(arg string) {
+	// The client sends the chunk right behind the command line, whatever the
+	// reply, so a refused chunk is read and dropped before the reply; left in
+	// the input, it would be read as commands. RFC 3030 section 2: "If a
+	// failure occurs after a BDAT command is received, the receiver-SMTP MUST
+	// accept and discard the associated message data before sending the
+	// appropriate 5XX or 4XX code."
+	//
+	// A refusal also fails the transaction: "If a 5XX or 4XX code is received
+	// by the sender-SMTP in response to a BDAT chunk, the transaction should
+	// be considered failed", and the receiver "MUST be prepared to accept and
+	// discard additional BDAT chunks already in the pipeline after the failed
+	// BDAT". Left open, the transaction would take a BDAT pipelined behind
+	// this one as its next chunk and deliver a message without this chunk.
+	refuse := func(chunkSize uint64, code int, enhCode EnhancedCode, text string) {
+		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(chunkSize)))
+		c.writeResponse(code, enhCode, text)
+		c.reset()
+	}
+
+	// Without a size there is no length to discard.
 	args := strings.Fields(arg)
 	if len(args) == 0 {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing chunk size argument")
-		return
-	}
-	if len(args) > 2 {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Too many arguments")
+		refuse(0, 501, EnhancedCode{5, 5, 4}, "Missing chunk size argument")
 		return
 	}
 
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	// ParseUint instead of Atoi so we will not accept negative values.
+	size, err := strconv.ParseUint(args[0], 10, 32)
+	if err != nil {
+		refuse(0, 501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+		return
+	}
+
+	if len(args) > 2 {
+		refuse(size, 501, EnhancedCode{5, 5, 4}, "Too many arguments")
 		return
 	}
 
 	last := false
 	if len(args) == 2 {
 		if !strings.EqualFold(args[1], "LAST") {
-			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
+			refuse(size, 501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
 			return
 		}
 		last = true
 	}
 
-	// ParseUint instead of Atoi so we will not accept negative values.
-	size, err := strconv.ParseUint(args[0], 10, 32)
-	if err != nil {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+	if !c.fromReceived || len(c.recipients) == 0 {
+		refuse(size, 502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
 	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
-		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
-
-		// Discard chunk itself without passing it to backend.
-		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(size)))
-
-		c.reset()
+		refuse(size, 552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 		return
 	}
 
