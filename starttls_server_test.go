@@ -229,8 +229,8 @@ func TestServer_STARTTLS_resetsTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp := readResponseLine(t, tlsScanner)
-	if !strings.HasPrefix(resp, "502") {
-		t.Fatalf("expected 502 (transaction reset) after STARTTLS, got %q", resp)
+	if !strings.HasPrefix(resp, "503") {
+		t.Fatalf("expected 503 (transaction reset) after STARTTLS, got %q", resp)
 	}
 }
 
