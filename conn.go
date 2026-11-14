@@ -646,8 +646,10 @@ func (c *Conn) handleMail(arg string) {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
+	// A BDAT transfer belongs to an open transaction: a bad sequence, like
+	// the nested MAIL below.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
 		return
 	}
 	// RFC 5321 section 4.1.1.2: MAIL is only permitted when there is no
@@ -1010,8 +1012,10 @@ func (c *Conn) handleRcpt(arg string) {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
+	// RFC 3030 section 2 sends BDAT "After all MAIL and RCPT responses are
+	// collected and processed": a RCPT after it is out of sequence.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
 
