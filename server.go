@@ -284,6 +284,13 @@ func (s *Server) handleConn(c *Conn) error {
 			}
 			return c.writeFailure
 		}
+		// A handler that closed the connection (a BDAT chunk that cannot be
+		// discarded, a panic) ends it here: commands the client pipelined are
+		// still in the read buffer, and reading them does not touch the
+		// closed socket, so they would run without a session.
+		if c.isClosed() {
+			return nil
+		}
 
 		line, err := c.readLine()
 		if err != nil {

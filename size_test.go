@@ -2,11 +2,15 @@ package smtp_test
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,12 +168,61 @@ func TestServer_BDATMalformedOverlongSize(t *testing.T) {
 	}
 }
 
+// Once the server has refused an unreadable chunk and closed the connection,
+// commands the client pipelined behind the BDAT, already in the server's
+// read buffer, are not handled: the session they would run on is gone.
+func TestServer_BDATChunkBeyondInt64IgnoresPipelinedCommands(t *testing.T) {
+	errorLog := &lockedBuffer{}
+	_, s, c, scanner := testBDATTransaction(t, 0, func(s *smtp.Server) {
+		s.ErrorLog = log.New(errorLog, "", 0)
+	})
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "BDAT 9223372036854775808\r\nRCPT TO:<root@gchq.gov.uk>\r\nNOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "552 5.3.4 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+	if scanner.Scan() {
+		t.Fatal("Expected the connection to be closed, got:", scanner.Text())
+	}
+
+	// Shutdown returns once the connection goroutine is done with what it
+	// had buffered.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal("Shutdown:", err)
+	}
+	if msg := errorLog.String(); msg != "" {
+		t.Fatal("Pipelined commands handled after the connection was closed:", msg)
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // testBDATTransaction starts a transaction ready for BDAT on a server with
 // the given MaxMessageBytes.
-func testBDATTransaction(t *testing.T, limit int64) (*backend, *smtp.Server, net.Conn, *bufio.Scanner) {
-	be, s, c, scanner, _ := testServerEhlo(t, func(s *smtp.Server) {
+func testBDATTransaction(t *testing.T, limit int64, fn ...serverConfigureFunc) (*backend, *smtp.Server, net.Conn, *bufio.Scanner) {
+	be, s, c, scanner, _ := testServerEhlo(t, append([]serverConfigureFunc{func(s *smtp.Server) {
 		s.MaxMessageBytes = limit
-	})
+	}}, fn...)...)
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 
 	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
