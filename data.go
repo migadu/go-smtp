@@ -51,8 +51,9 @@ type dataReader struct {
 	r     *bufio.Reader
 	state int
 
-	limited bool
-	n       int64 // Maximum bytes remaining
+	limited  bool
+	n        int64 // Maximum bytes remaining
+	tooLarge bool  // A message octet beyond the limit was read
 }
 
 func newDataReader(c *Conn) *dataReader {
@@ -69,13 +70,8 @@ func newDataReader(c *Conn) *dataReader {
 }
 
 func (r *dataReader) Read(b []byte) (n int, err error) {
-	if r.limited {
-		if r.n <= 0 {
-			return 0, ErrDataTooLarge
-		}
-		if int64(len(b)) > r.n {
-			b = b[0:r.n]
-		}
+	if r.limited && r.tooLarge {
+		return 0, ErrDataTooLarge
 	}
 
 	// Code below is taken from net/textproto with only one modification to
@@ -133,6 +129,15 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 			if c == '\r' {
 				r.state = stateCR
 			}
+		}
+		if r.limited && int64(n) == r.n {
+			// A message octet beyond the limit. Checked here rather than by
+			// shortening b, so that the end-of-data line after a message of
+			// exactly the limit is still read: it is not part of the message
+			// size (RFC 1870 section 5).
+			r.tooLarge = true
+			err = ErrDataTooLarge
+			break
 		}
 		b[n] = c
 		n++
