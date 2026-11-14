@@ -351,3 +351,48 @@ func isTimeout(err error) bool {
 	}
 	return false
 }
+
+// The server answers a BDAT chunk it cannot read to its end itself, before the
+// backend has the whole message: with a temporary failure, since a stalled or
+// cut-off transfer says nothing about the message. A permanent reply would make
+// the client bounce a message it can deliver later.
+func TestBDATContentErrorIsTemporary(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*smtp.Server)
+		send      func(net.Conn)
+	}{
+		{
+			name:      "ReadTimeout",
+			configure: func(s *smtp.Server) { s.ReadTimeout = 200 * time.Millisecond },
+			send:      func(conn net.Conn) { io.WriteString(conn, trickleLine) },
+		},
+		{
+			name: "DataTimeout",
+			configure: func(s *smtp.Server) {
+				s.ReadTimeout = time.Minute
+				s.DataTimeout = 300 * time.Millisecond
+			},
+			send: func(conn net.Conn) { go trickle(conn, 40, 50*time.Millisecond) },
+		},
+	}
+	for _, mode := range []transferMode{{name: "BDAT", bdat: true}, {name: "LMTP BDAT", lmtp: true, bdat: true}} {
+		for _, tc := range cases {
+			mode, tc := mode, tc
+			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				tt := startTransfer(t, mode, tc.configure)
+				tt.begin(40 * len(trickleLine))
+				tc.send(tt.conn)
+
+				tt.result()
+				if reply := tt.reply(); !strings.HasPrefix(reply, "421 4.4.2 ") {
+					t.Errorf("chunk that could not be read answered %q, want 421 4.4.2", reply)
+				}
+				if tt.scanner.Scan() {
+					t.Errorf("connection kept open after the chunk failed: read %q", tt.scanner.Text())
+				}
+			})
+		}
+	}
+}

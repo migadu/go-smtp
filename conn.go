@@ -1532,11 +1532,19 @@ func (c *Conn) handleBdat(arg string) {
 	chunk := io.LimitReader(cr, int64(size))
 	_, err = io.Copy(c.bdatPipe, chunk)
 	if err != nil {
-		// Backend might return an error early using CloseWithError without consuming
-		// the whole chunk.
+		// Either the chunk could not be read, or the backend returned an error
+		// early using CloseWithError without consuming the whole chunk.
+		readErr := cr.err
 		io.Copy(io.Discard, chunk)
 
-		c.writeResponse(dataErrorToStatus(err))
+		if readErr != nil {
+			// The reply is the server's, not the backend's: failing to receive
+			// the chunk is temporary and says nothing about the message, so a
+			// 5xx here would make the client bounce mail it can deliver later.
+			c.writeResponse(421, EnhancedCode{4, 4, 2}, "Error reading message data, closing connection")
+		} else {
+			c.writeResponse(dataErrorToStatus(err))
+		}
 
 		if err == errPanic {
 			c.Close()
