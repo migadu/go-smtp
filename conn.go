@@ -74,6 +74,9 @@ type Conn struct {
 	bdatStatus    *statusCollector   // used for BDAT on LMTP
 	dataResult    chan error
 	bytesReceived int64 // counts total size of chunks when BDAT is used
+	// A BDAT chunk was refused, but the transaction was left open for the
+	// BDAT LAST that gets no reply in LMTP; see handleBdat.
+	bdatFailed bool
 
 	fromReceived bool
 	recipients   []string
@@ -1024,6 +1027,13 @@ func (c *Conn) handleRcpt(arg string) {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
+	// RFC 3030 section 2: after a refused BDAT "the transaction should be
+	// considered failed". A recipient accepted now would let a BDAT LAST
+	// complete a message that lacks the refused chunk.
+	if c.bdatFailed {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed after a refused BDAT")
+		return
+	}
 
 	arg, ok := cutPrefixFold(arg, "TO:")
 	if !ok {
@@ -1515,12 +1525,14 @@ func (c *Conn) handleBdat(arg string) {
 		//
 		// A chunk before the last one is refused, one reply, but unlike other
 		// refusals it leaves the transaction open: the client still counts
-		// zero replies for the BDAT LAST it pipelined behind this chunk.
+		// zero replies for the BDAT LAST it pipelined behind this chunk. The
+		// transaction has failed all the same, and takes no more recipients.
 		readErr := discard(size)
 		if last {
 			c.reset()
 		} else {
 			c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+			c.bdatFailed = true
 		}
 		if readErr != nil {
 			c.endAfterContentError(readErr)
@@ -2273,6 +2285,7 @@ func (c *Conn) resetState() Session {
 		c.bdatCtxCancel = nil
 	}
 	c.bdatStatus = nil
+	c.bdatFailed = false
 	c.bytesReceived = 0
 	c.fromReceived = false
 	c.recipients = nil
