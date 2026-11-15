@@ -1439,12 +1439,12 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.withCommandContext(func(ctx context.Context) error {
+	err := c.withCommandContext(func(ctx context.Context) error {
 		return c.Session().Data(ctx, r)
-	}))
+	})
 	r.limited = false
 	io.Copy(io.Discard, r) // Make sure all the data has been consumed
-	c.writeResponse(code, enhancedCode, msg)
+	c.writeResponse(contentErrorToStatus(err, r.r.failed()))
 	if err := r.r.err; err != nil { // the content could not be read to its end
 		c.endAfterContentError(err)
 	}
@@ -1797,7 +1797,10 @@ func (c *Conn) handleDataLMTP() {
 	}
 
 	for i, rcpt := range c.recipients {
-		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
+		err := <-status.status[i]
+		// The backend may still be reading the content: r.r.err is its to
+		// touch until done.
+		code, enchCode, msg := contentErrorToStatus(err, r.r.failed())
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
 
@@ -1808,6 +1811,24 @@ func (c *Conn) handleDataLMTP() {
 	} else if err := r.r.err; err != nil {
 		c.endAfterContentError(err)
 	}
+}
+
+// contentErrorToStatus is dataErrorToStatus for the backend's answer to a DATA
+// body. When the body could not be read to its end (contentFailed), a backend
+// error without a reply of its own is as a rule that read error handed back.
+// Answered like any other, "554 5.0.0 Error: transaction failed: read tcp
+// ...", it would make the client bounce a message it can deliver later and
+// show it the connection's addresses: failing to receive the content is
+// temporary and says nothing about the message. It gets the reply a BDAT
+// chunk that cannot be read gets. A reply the backend chose itself, an
+// *SMTPError, is kept.
+func contentErrorToStatus(err error, contentFailed bool) (code int, enchCode EnhancedCode, msg string) {
+	if err != nil && contentFailed {
+		if _, ok := err.(*SMTPError); !ok {
+			return 421, EnhancedCode{4, 4, 2}, "Error reading message data, closing connection"
+		}
+	}
+	return dataErrorToStatus(err)
 }
 
 func dataErrorToStatus(err error) (code int, enchCode EnhancedCode, msg string) {

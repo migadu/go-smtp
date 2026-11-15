@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,6 +66,7 @@ type contentReader struct {
 	r        *bufio.Reader
 	deadline time.Time // start + Server.DataTimeout; zero if unset
 	err      error
+	hasErr   uint32 // atomic: err is set; see failed
 }
 
 func newContentReader(c *Conn) *contentReader {
@@ -88,7 +90,14 @@ func (cr *contentReader) fail(err error) error {
 		err = io.ErrUnexpectedEOF
 	}
 	cr.err = err
+	atomic.StoreUint32(&cr.hasErr, 1)
 	return err
+}
+
+// failed reports whether the content could not be read to its end. Unlike
+// err, it may be called while another goroutine is reading.
+func (cr *contentReader) failed() bool {
+	return atomic.LoadUint32(&cr.hasErr) != 0
 }
 
 func (cr *contentReader) ReadByte() (byte, error) {
