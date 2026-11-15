@@ -570,8 +570,8 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.EnableDSN {
 		caps = append(caps, "DSN")
 	}
-	if c.server.MaxMessageBytes > 0 {
-		caps = append(caps, fmt.Sprintf("SIZE %v", c.server.MaxMessageBytes))
+	if limit := c.server.maxMessageBytes(); limit > 0 {
+		caps = append(caps, fmt.Sprintf("SIZE %v", limit))
 	} else {
 		caps = append(caps, "SIZE")
 	}
@@ -695,7 +695,7 @@ func (c *Conn) handleMail(arg string) {
 				return
 			}
 
-			if c.server.MaxMessageBytes > 0 && int64(size) > c.server.MaxMessageBytes {
+			if limit := c.server.maxMessageBytes(); limit > 0 && int64(size) > limit {
 				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 				return
 			}
@@ -1471,7 +1471,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
+	if limit := c.server.maxMessageBytes(); limit > 0 && c.bytesReceived+int64(size) > limit {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
@@ -1678,6 +1678,7 @@ func (c *Conn) handleDataLMTP() {
 		err := c.withCommandContext(func(ctx context.Context) error {
 			return c.Session().Data(ctx, r)
 		})
+		r.limited = false
 		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1702,6 +1703,7 @@ func (c *Conn) handleDataLMTP() {
 			status.fillRemaining(c.withCommandContext(func(ctx context.Context) error {
 				return lmtpSession.LMTPData(ctx, r, status)
 			}))
+			r.limited = false
 			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()

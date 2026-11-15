@@ -42,6 +42,14 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// MaxMessageBytesFunc, if set, is called for the message size limit
+	// whenever the server uses it (the SIZE keyword of the EHLO and LHLO
+	// replies, the SIZE parameter of MAIL, and DATA and BDAT) and takes
+	// precedence over MaxMessageBytes, so that the limit can change while
+	// the server runs. It must be safe for concurrent use. A value of zero
+	// or less means no limit.
+	MaxMessageBytesFunc func() int64
+
 	// Maximum number of concurrently open connections the server accepts.
 	// Connections above the limit are rejected with a 421 reply and closed.
 	// If zero, there is no limit.
@@ -154,6 +162,15 @@ func NewServer(be Backend) *Server {
 		ErrorLog: log.New(os.Stderr, "smtp/server ", log.LstdFlags),
 		conns:    make(map[*Conn]struct{}),
 	}
+}
+
+// maxMessageBytes returns the message size limit in force, or zero or less
+// for none.
+func (s *Server) maxMessageBytes() int64 {
+	if s.MaxMessageBytesFunc != nil {
+		return s.MaxMessageBytesFunc()
+	}
+	return s.MaxMessageBytes
 }
 
 // AddXCLIENTTrustedNetwork adds a trusted network for XCLIENT command.
