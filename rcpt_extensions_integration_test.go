@@ -44,8 +44,6 @@ func (s *TestSessionWithExtensions) Rcpt(ctx context.Context, to string, opts *R
 		OriginalRecipientType:      opts.OriginalRecipientType,
 		OriginalRecipient:          opts.OriginalRecipient,
 		RequireRecipientValidSince: opts.RequireRecipientValidSince,
-		DeliverBy:                  opts.DeliverBy,
-		MTPriority:                 opts.MTPriority,
 	}
 	if opts.Extensions != nil {
 		optsCopy.Extensions = make(map[string]string)

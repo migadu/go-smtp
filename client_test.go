@@ -58,6 +58,140 @@ func (toServerNoRespAuth) Next(fromServer []byte) (toServer []byte, err error) {
 	panic("unexpected call")
 }
 
+// A mechanism without an initial response must answer the first challenge
+// itself, not with an empty line.
+func TestClientAuthNoInitialResponse(t *testing.T) {
+	server := "334 Y2hhbGxlbmdl\r\n" +
+		"235 2.0.0 OK\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(challengeAuth{}); err != nil {
+		t.Fatalf("Auth: %v", err)
+	}
+	c.Close()
+	if got, want := wrote.String(), "AUTH CHALLENGE\r\ncmVzcG9uc2U=\r\n"; got != want {
+		t.Errorf("wrote %q; want %q", got, want)
+	}
+}
+
+type challengeAuth struct{}
+
+func (challengeAuth) Start() (proto string, toServer []byte, err error) {
+	return "CHALLENGE", nil, nil
+}
+
+func (challengeAuth) Next(fromServer []byte) (toServer []byte, err error) {
+	return []byte("response"), nil
+}
+
+// A SASL initial response too large to inline within the 512-octet command-line
+// limit must be deferred to the first challenge instead of being appended to the
+// AUTH command line. https://github.com/emersion/go-smtp/issues/301
+func TestClientAuthLargeInitialResponse(t *testing.T) {
+	server := "334 \r\n" +
+		"235 2.0.0 OK\r\n"
+	client := "AUTH LARGE\r\n" +
+		strings.Repeat("eHh4", 200) + "\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(largeInitialRespAuth{mech: "LARGE", resp: bytes.Repeat([]byte("x"), 600)}); err != nil {
+		t.Fatalf("Auth: %v", err)
+	}
+	c.Close()
+	if got := wrote.String(); got != client {
+		t.Errorf("wrote %q; want %q", got, client)
+	}
+}
+
+// A challenge in the reply to AUTH aborts the exchange instead of dropping the
+// deferred initial response.
+func TestClientAuthLargeInitialResponseChallenge(t *testing.T) {
+	server := "334 Y2hhbGxlbmdl\r\n" +
+		"501 5.7.0 Authentication aborted\r\n"
+	client := "AUTH LARGE\r\n" +
+		"*\r\n"
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	if err := c.Auth(largeInitialRespAuth{mech: "LARGE", resp: bytes.Repeat([]byte("x"), 600)}); err == nil {
+		t.Fatal("Auth succeeded; want an error")
+	}
+	c.Close()
+	if got := wrote.String(); got != client {
+		t.Errorf("wrote %q; want %q", got, client)
+	}
+}
+
+// An AUTH line of exactly 512 octets is still sent inline; one more octet defers it.
+func TestClientAuthInitialResponseLimit(t *testing.T) {
+	resp64 := strings.Repeat("eHh4", 125) // 500 octets
+	for _, tc := range []struct {
+		mech, server, client string
+	}{
+		{"ABCD", "235 2.0.0 OK\r\n", "AUTH ABCD " + resp64 + "\r\n"},
+		{"ABCDE", "334 \r\n235 2.0.0 OK\r\n", "AUTH ABCDE\r\n" + resp64 + "\r\n"},
+	} {
+		var wrote bytes.Buffer
+		var fake faker
+		fake.ReadWriter = struct {
+			io.Reader
+			io.Writer
+		}{
+			strings.NewReader(tc.server),
+			&wrote,
+		}
+		c := NewClient(fake)
+		c.didHello = true
+		if err := c.Auth(largeInitialRespAuth{mech: tc.mech, resp: bytes.Repeat([]byte("x"), 375)}); err != nil {
+			t.Fatalf("Auth(%s): %v", tc.mech, err)
+		}
+		c.Close()
+		if got := wrote.String(); got != tc.client {
+			t.Errorf("Auth(%s): wrote %q; want %q", tc.mech, got, tc.client)
+		}
+	}
+}
+
+// largeInitialRespAuth returns a large SASL initial response from Start.
+type largeInitialRespAuth struct {
+	mech string
+	resp []byte
+}
+
+func (a largeInitialRespAuth) Start() (proto string, toServer []byte, err error) {
+	return a.mech, a.resp, nil
+}
+
+func (a largeInitialRespAuth) Next(fromServer []byte) (toServer []byte, err error) {
+	return []byte("response"), nil
+}
+
 type faker struct {
 	io.ReadWriter
 }
@@ -1270,6 +1404,68 @@ Goodbye.`
 	}
 }
 
+func TestLMTPDataTwoMessages(t *testing.T) {
+	var lmtpServerTwoMessages = `220 localhost Simple Mail Transfer Service Ready
+250-localhost at your service
+250 8BITMIME
+250 Sender OK
+250 Receiver OK
+354 Go ahead
+250 First message OK
+250 Sender OK
+250 Receiver OK
+354 Go ahead
+250 Second message OK
+221 OK
+`
+	server := strings.Join(strings.Split(lmtpServerTwoMessages, "\n"), "\r\n")
+
+	var cmdbuf bytes.Buffer
+	bcmdbuf := bufio.NewWriter(&cmdbuf)
+	var fake faker
+	fake.ReadWriter = bufio.NewReadWriter(bufio.NewReader(strings.NewReader(server)), bcmdbuf)
+	c := &Client{text: textproto.NewConn(fake), conn: fake, lmtp: true}
+
+	if err := c.Hello("localhost"); err != nil {
+		t.Fatalf("LHLO failed: %s", err)
+	}
+	c.didHello = true
+
+	send := func(rcpt, statusText string) {
+		t.Helper()
+
+		if err := c.Mail("user@gmail.com", nil); err != nil {
+			t.Fatalf("MAIL failed: %s", err)
+		}
+		if err := c.Rcpt(rcpt, nil); err != nil {
+			t.Fatalf("RCPT failed: %s", err)
+		}
+		w, err := c.Data()
+		if err != nil {
+			t.Fatalf("DATA failed: %s", err)
+		}
+		if _, err := w.Write([]byte("Hello")); err != nil {
+			t.Fatalf("Data write failed: %s", err)
+		}
+		resp, err := w.CloseWithLMTPResponse()
+		if err != nil {
+			t.Fatalf("CloseWithLMTPResponse failed: %s", err)
+		}
+
+		wantResp := map[string]*DataResponse{rcpt: {StatusText: statusText}}
+		if !reflect.DeepEqual(resp, wantResp) {
+			t.Fatalf("resp = %v, want %v", resp, wantResp)
+		}
+	}
+
+	send("golang-nuts@googlegroups.com", "First message OK")
+	send("golang-not-nuts@googlegroups.com", "Second message OK")
+
+	if err := c.Quit(); err != nil {
+		t.Fatalf("QUIT failed: %s", err)
+	}
+}
+
 var xtextClient = `MAIL FROM:<e=mc2@example.com> AUTH=e+3Dmc2@example.com
 RCPT TO:<e=mc2@example.com> ORCPT=UTF-8;e\x{3D}mc2@example.com
 `
@@ -1402,7 +1598,7 @@ var deliverByServer = `220 hello world
 250 ok
 `
 
-var deliverByClient = `RCPT TO:<root@nsa.gov> BY=100;RT
+var deliverByClient = `MAIL FROM:<root@nsa.gov> BY=100;RT
 `
 
 func TestClientDELIVERBY(t *testing.T) {
@@ -1421,7 +1617,7 @@ func TestClientDELIVERBY(t *testing.T) {
 	c := NewClient(fake)
 	c.didHello = true
 	c.ext = map[string]string{"DELIVERBY": ""}
-	c.Rcpt("root@nsa.gov", &RcptOptions{
+	c.Mail("root@nsa.gov", &MailOptions{
 		DeliverBy: &DeliverByOptions{
 			Time:  100 * time.Second,
 			Mode:  DeliverByReturn,
@@ -1438,7 +1634,7 @@ var mtPriorityServer = `220 hello world
 250 ok
 `
 
-var mtPriorityClient = `RCPT TO:<root@nsa.gov> MT-PRIORITY=6
+var mtPriorityClient = `MAIL FROM:<root@nsa.gov> MT-PRIORITY=6
 `
 
 func TestClientMTPRIORITY(t *testing.T) {
@@ -1458,7 +1654,7 @@ func TestClientMTPRIORITY(t *testing.T) {
 	c.didHello = true
 	c.ext = map[string]string{"MT-PRIORITY": ""}
 	priority := 6
-	c.Rcpt("root@nsa.gov", &RcptOptions{
+	c.Mail("root@nsa.gov", &MailOptions{
 		MTPriority: &priority,
 	})
 	c.Close()
