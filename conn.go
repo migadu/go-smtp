@@ -1441,44 +1441,71 @@ func (c *Conn) handleData(arg string) {
 }
 
 func (c *Conn) handleBdat(arg string) {
+	// The client sends the chunk right behind the command line, whatever the
+	// reply, so a refused chunk is read and dropped before the reply; left in
+	// the input, it would be read as commands. RFC 3030 section 2: "If a
+	// failure occurs after a BDAT command is received, the receiver-SMTP MUST
+	// accept and discard the associated message data before sending the
+	// appropriate 5XX or 4XX code."
+	//
+	// A refusal also fails the transaction: "If a 5XX or 4XX code is received
+	// by the sender-SMTP in response to a BDAT chunk, the transaction should
+	// be considered failed", and the receiver "MUST be prepared to accept and
+	// discard additional BDAT chunks already in the pipeline after the failed
+	// BDAT". Left open, the transaction would take a BDAT pipelined behind
+	// this one as its next chunk and deliver a message without this chunk.
+	//
+	// A chunk that cannot be read to its end still gets the refusal, and the
+	// connection is then closed: what follows cannot be told from commands.
+	refuse := func(chunkSize int64, code int, enhCode EnhancedCode, text string) {
+		cr := newContentReader(c)
+		io.Copy(io.Discard, io.LimitReader(cr, chunkSize))
+		c.writeResponse(code, enhCode, text)
+		c.reset()
+		if cr.err != nil {
+			c.endAfterContentError(cr.err)
+		}
+	}
+
+	// Without a size there is no length to discard.
 	args := strings.Fields(arg)
 	if len(args) == 0 {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing chunk size argument")
-		return
-	}
-	if len(args) > 2 {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Too many arguments")
+		refuse(0, 501, EnhancedCode{5, 5, 4}, "Missing chunk size argument")
 		return
 	}
 
-	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
-	// which ended the transaction: RFC 3030 section 2 requires 503 for it.
-	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+	size, tooLarge, err := parseSize(args[0])
+	if err != nil {
+		refuse(0, 501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+		return
+	}
+
+	if tooLarge {
+		// A chunk this large cannot be discarded, and the rest of the
+		// connection would be read as commands.
+		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded, closing connection")
+		c.Close()
+		return
+	}
+
+	if len(args) > 2 {
+		refuse(size, 501, EnhancedCode{5, 5, 4}, "Too many arguments")
 		return
 	}
 
 	last := false
 	if len(args) == 2 {
 		if !strings.EqualFold(args[1], "LAST") {
-			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
+			refuse(size, 501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
 			return
 		}
 		last = true
 	}
 
-	size, tooLarge, err := parseSize(args[0])
-	if err != nil {
-		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed size argument")
-		return
-	}
-
-	if tooLarge {
-		// RFC 3030 section 2 has a refused chunk discarded so that the next
-		// command can be read; a chunk this large cannot be, and the rest of
-		// the connection would be read as commands.
-		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded, closing connection")
-		c.Close()
+	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
+	// which ended the transaction: RFC 3030 section 2 requires 503 for it.
+	if !c.fromReceived || len(c.recipients) == 0 {
+		refuse(size, 503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1486,16 +1513,7 @@ func (c *Conn) handleBdat(arg string) {
 	// never takes past the limit, so that a size near the largest int64
 	// cannot overflow the check.
 	if limit := c.server.maxMessageBytes(); limit > 0 && size > limit-c.bytesReceived {
-		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
-
-		// Discard chunk itself without passing it to backend.
-		cr := newContentReader(c)
-		io.Copy(io.Discard, io.LimitReader(cr, size))
-
-		c.reset()
-		if cr.err != nil {
-			c.endAfterContentError(cr.err)
-		}
+		refuse(size, 552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 		return
 	}
 

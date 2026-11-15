@@ -85,13 +85,11 @@ func TestServer_BDATChunkBeyond32Bits(t *testing.T) {
 	defer s.Close()
 	defer c.Close()
 
-	// The 552 is written before the server starts discarding the chunk, so
-	// it arrives without the chunk being sent.
+	// The server reads and drops a refused chunk before it replies, so the
+	// client ends its side instead of sending 5 GB: the 552 follows the end
+	// of the input.
 	io.WriteString(c, "BDAT 5000000000\r\n")
-	scanner.Scan()
-	if !strings.HasPrefix(scanner.Text(), "552 5.3.4 ") {
-		t.Fatal("Invalid BDAT response:", scanner.Text())
-	}
+	expectBDATRefusedAtEndOfInput(t, c, scanner)
 }
 
 // The limit check must not overflow when a chunk size close to the largest
@@ -108,9 +106,28 @@ func TestServer_BDATChunkOverflowingLimitCheck(t *testing.T) {
 	}
 
 	io.WriteString(c, "BDAT 9223372036854775800\r\n")
+	expectBDATRefusedAtEndOfInput(t, c, scanner)
+}
+
+// expectBDATRefusedAtEndOfInput ends the client's side of the connection in
+// place of a chunk too large to send, and expects the 552 for the BDAT just
+// sent, then the connection closed: a chunk the server could not read to its
+// end leaves nothing it could take for commands.
+func expectBDATRefusedAtEndOfInput(t *testing.T, c net.Conn, scanner *bufio.Scanner) {
+	t.Helper()
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal("CloseWrite:", err)
+	}
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "552 5.3.4 ") {
 		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+	if scanner.Scan() {
+		t.Fatal("Expected the connection to be closed, got:", scanner.Text())
+	}
+	var ne net.Error
+	if err := scanner.Err(); errors.As(err, &ne) && ne.Timeout() {
+		t.Fatal("Connection left open after a chunk cut short")
 	}
 }
 
