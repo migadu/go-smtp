@@ -1447,7 +1447,12 @@ func (c *Conn) handleBdat(arg string) {
 	// failure occurs after a BDAT command is received, the receiver-SMTP MUST
 	// accept and discard the associated message data before sending the
 	// appropriate 5XX or 4XX code."
-	//
+	discard := func(chunkSize int64) error {
+		cr := newContentReader(c)
+		io.Copy(io.Discard, io.LimitReader(cr, chunkSize))
+		return cr.err
+	}
+
 	// A refusal also fails the transaction: "If a 5XX or 4XX code is received
 	// by the sender-SMTP in response to a BDAT chunk, the transaction should
 	// be considered failed", and the receiver "MUST be prepared to accept and
@@ -1458,12 +1463,11 @@ func (c *Conn) handleBdat(arg string) {
 	// A chunk that cannot be read to its end still gets the refusal, and the
 	// connection is then closed: what follows cannot be told from commands.
 	refuse := func(chunkSize int64, code int, enhCode EnhancedCode, text string) {
-		cr := newContentReader(c)
-		io.Copy(io.Discard, io.LimitReader(cr, chunkSize))
+		readErr := discard(chunkSize)
 		c.writeResponse(code, enhCode, text)
 		c.reset()
-		if cr.err != nil {
-			c.endAfterContentError(cr.err)
+		if readErr != nil {
+			c.endAfterContentError(readErr)
 		}
 	}
 
@@ -1500,6 +1504,28 @@ func (c *Conn) handleBdat(arg string) {
 			return
 		}
 		last = true
+	}
+
+	if c.server.LMTP && c.fromReceived && len(c.recipients) == 0 {
+		// An LMTP transaction without an accepted recipient. RFC 2033 section
+		// 4.3: "If there were no previously successful RCPT commands in the
+		// mail transaction, then the BDAT LAST command returns zero replies."
+		// A reply would be one more than the client counts. The transaction
+		// ends with no message for anyone: the chunk is read and dropped.
+		//
+		// A chunk before the last one is refused, one reply, but unlike other
+		// refusals it leaves the transaction open: the client still counts
+		// zero replies for the BDAT LAST it pipelined behind this chunk.
+		readErr := discard(size)
+		if last {
+			c.reset()
+		} else {
+			c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		}
+		if readErr != nil {
+			c.endAfterContentError(readErr)
+		}
+		return
 	}
 
 	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
