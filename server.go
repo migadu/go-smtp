@@ -39,8 +39,27 @@ type Server struct {
 	AllowInsecureAuth bool
 	Debug             io.Writer
 	ErrorLog          Logger
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
+	// ReadTimeout bounds each wait for client input: for the next command
+	// line, and for more message content during DATA and BDAT. It does not
+	// bound a whole transfer (see DataTimeout).
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+
+	// DataTimeout, if non-zero, bounds the time a client may take to send
+	// message content: a DATA body, counted from the 354 reply, or a BDAT
+	// chunk, counted from its command line. ReadTimeout still bounds each
+	// wait within it. A client that keeps sending is therefore not cut off
+	// after ReadTimeout, while one that trickles content cannot make a
+	// transfer last longer than this.
+	DataTimeout time.Duration
+
+	// MaxMessageBytesFunc, if set, is called for the message size limit
+	// whenever the server uses it (the SIZE keyword of the EHLO and LHLO
+	// replies, the SIZE parameter of MAIL, and DATA and BDAT) and takes
+	// precedence over MaxMessageBytes, so that the limit can change while
+	// the server runs. It must be safe for concurrent use. A value of zero
+	// or less means no limit.
+	MaxMessageBytesFunc func() int64
 
 	// Maximum number of concurrently open connections the server accepts.
 	// Connections above the limit are rejected with a 421 reply and closed.
@@ -58,11 +77,11 @@ type Server struct {
 	BaseContext func(l net.Listener) context.Context
 
 	// OnTimeout, if set, is called exactly once when the server disconnects
-	// a client whose read deadline (ReadTimeout) expired while waiting for
-	// input — between commands or during a SASL continuation. It fires after
-	// the "421 4.4.2 Idle timeout" response is written and before the
-	// connection closes. Intended for metrics; keep it fast and
-	// non-blocking. The server owns the idle timer, so an embedder that also
+	// a client whose read deadline expired while waiting for input — between
+	// commands, during a SASL continuation or during message content. It
+	// fires after the "421 4.4.2 Idle timeout" response (for message content,
+	// the transaction's reply) is written and before the connection closes.
+	// Intended for metrics; keep it fast and non-blocking. The server owns the idle timer, so an embedder that also
 	// wraps the net.Conn in its own idle checker should disarm that checker
 	// and count disconnects from this hook instead — two owners of the same
 	// timer race each other and can send the client a duplicate notice.
@@ -154,6 +173,15 @@ func NewServer(be Backend) *Server {
 		ErrorLog: log.New(os.Stderr, "smtp/server ", log.LstdFlags),
 		conns:    make(map[*Conn]struct{}),
 	}
+}
+
+// maxMessageBytes returns the message size limit in force, or zero or less
+// for none.
+func (s *Server) maxMessageBytes() int64 {
+	if s.MaxMessageBytesFunc != nil {
+		return s.MaxMessageBytesFunc()
+	}
+	return s.MaxMessageBytes
 }
 
 // AddXCLIENTTrustedNetwork adds a trusted network for XCLIENT command.
@@ -283,6 +311,13 @@ func (s *Server) handleConn(c *Conn) error {
 				return nil
 			}
 			return c.writeFailure
+		}
+		// A handler that closed the connection (a BDAT chunk that cannot be
+		// discarded, a panic) ends it here: commands the client pipelined are
+		// still in the read buffer, and reading them does not touch the
+		// closed socket, so they would run without a session.
+		if c.isClosed() {
+			return nil
 		}
 
 		line, err := c.readLine()

@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,27 @@ func cutPrefixFold(s, prefix string) (string, bool) {
 		return "", false
 	}
 	return s[len(prefix):], true
+}
+
+// parseSize parses the size declared by the SIZE parameter of MAIL
+// (RFC 1870 section 3: "size-value ::= 1*20DIGIT") or by BDAT (RFC 3030
+// section 2: "chunk-size ::= 1*DIGIT"). Neither grammar is bounded by the
+// integer types, so a size too large for an int64 is valid syntax: tooLarge
+// reports it, and it exceeds any limit the server can have.
+func parseSize(s string) (size int64, tooLarge bool, err error) {
+	// ParseUint, unlike ParseInt, refuses a sign; a bit size of 63 keeps
+	// the result within an int64.
+	n, err := strconv.ParseUint(s, 10, 63)
+	if err != nil {
+		// ParseUint reports the range error as soon as the digits read so
+		// far overflow, before it looks at the rest of s: only a string of
+		// digits alone is a size too large rather than a syntax error.
+		if errors.Is(err, strconv.ErrRange) && strings.Trim(s, "0123456789") == "" {
+			return 0, true, nil
+		}
+		return 0, false, err
+	}
+	return int64(n), false, nil
 }
 
 func parseCmd(line string) (cmd string, arg string, err error) {

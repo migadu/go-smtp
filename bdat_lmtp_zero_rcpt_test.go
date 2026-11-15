@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -158,7 +159,21 @@ func TestServer_LMTPBDATLastAfterRefusedChunkNoReply(t *testing.T) {
 	}
 }
 
-// Outside that one state a BDAT without an accepted recipient keeps its single
+// A zero-reply chunk the client does not send to its end leaves nothing the
+// server could tell from commands: the connection is closed, still without a
+// reply. The part of the chunk that was sent is command text on purpose.
+func TestServer_LMTPBDATLastWithoutRecipientsChunkCutShort(t *testing.T) {
+	_, c, r := startZeroRcptTest(t, true, [][2]string{zeroRcptMail, zeroRcptRefused})
+
+	io.WriteString(c, "BDAT 100 LAST\r\nNOOP\r\n")
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal("CloseWrite:", err)
+	}
+	if line, err := r.ReadString('\n'); err != io.EOF {
+		t.Fatalf("after a BDAT LAST chunk cut short: %q, %v; want the connection closed without a reply", line, err)
+	}
+}
+
 // refusal: a chunk that is not the last one (RFC 3030 section 2: "A 250
 // response MUST be sent to each successful BDAT data block"; this one is not
 // successful), BDAT in SMTP, where the zero-reply rule does not exist, and

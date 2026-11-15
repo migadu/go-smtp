@@ -76,16 +76,16 @@ func TestServer_BDATOversizedChunkDiscard(t *testing.T) {
 		t.Fatal("Invalid RCPT response:", scanner.Text())
 	}
 
-	// One long line, no newline, longer than MaxLineLength. The 552 is
-	// written before the server starts discarding the chunk, so wait for it
-	// before sending the payload.
+	// One long line, no newline, longer than MaxLineLength. It is sent
+	// right behind the command line, as a client sends it: the 552 comes
+	// once the chunk has been discarded (RFC 3030 section 2).
 	payload := strings.Repeat("a", 5000)
 	io.WriteString(c, fmt.Sprintf("BDAT %d\r\n", len(payload)))
+	io.WriteString(c, payload)
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "552 ") {
 		t.Fatal("Invalid BDAT response:", scanner.Text())
 	}
-	io.WriteString(c, payload)
 
 	// The whole chunk must have been consumed: the next command must parse.
 	io.WriteString(c, "NOOP\r\n")
