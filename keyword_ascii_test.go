@@ -25,16 +25,16 @@ func TestServer_KeywordLookalikesAreNotKeywords(t *testing.T) {
 		name  string
 		setup []string // each answered 250
 		line  string
-		want  string // prefix of the reply to line
+		want  string // prefix of the reply to line; "" for an unknown parameter's reply
 	}{
 		{"command name with dotless i", nil, "MAıL FROM:<root@example.com>", "500 5.5.2 "},
 		{"command name with long s", nil, "RſET", "500 5.5.2 "},
 		{"QUIT with dotless i", nil, "QUıT", "500 5.5.2 "},
-		{"MAIL parameter name", nil, mail + " ſIZE=1", "500 5.5.4 "},
-		{"MAIL parameter without value", nil, mail + " ſMTPUTF8", "500 5.5.4 "},
+		{"MAIL parameter name", nil, mail + " ſIZE=1", ""},
+		{"MAIL parameter without value", nil, mail + " ſMTPUTF8", ""},
 		{"BODY value", nil, mail + " BODY=8BıTMIME", "501 5.5.4 "},
 		{"RET value", nil, mail + " RET=HDRſ", "501 5.5.4 "},
-		{"RCPT parameter name", []string{mail}, rcpt + " NOTıFY=NEVER", "500 5.5.4 "},
+		{"RCPT parameter name", []string{mail}, rcpt + " NOTıFY=NEVER", ""},
 		{"NOTIFY value", []string{mail}, rcpt + " NOTIFY=SUCCEſS", "501 5.5.4 "},
 		{"BDAT LAST", []string{mail, rcpt}, "BDAT 0 LAſT", "501 5.5.4 "},
 		{"AUTH mechanism", nil, "AUTH PLAıN AHVzZXJuYW1lAHBhc3N3b3Jk", "504 5.7.4 "},
@@ -68,12 +68,28 @@ func TestServer_KeywordLookalikesAreNotKeywords(t *testing.T) {
 				}
 			}
 
+			want := tt.want
+			if want == "" {
+				// The same line with the look-alike replaced by "X" names
+				// an unknown parameter; the look-alike must get that reply,
+				// whatever code the server gives an unknown parameter.
+				unknown := asciiX.Replace(tt.line)
+				io.WriteString(c, unknown+"\r\n")
+				if !scanner.Scan() {
+					t.Fatalf("%s: connection closed: %v", unknown, scanner.Err())
+				}
+				want = scanner.Text()
+				if !strings.HasPrefix(want, "5") {
+					t.Fatalf("%s: got %q, want a 5yz reply", unknown, want)
+				}
+			}
+
 			io.WriteString(c, tt.line+"\r\n")
 			if !scanner.Scan() {
 				t.Fatalf("%s: connection closed: %v", tt.line, scanner.Err())
 			}
-			if got := scanner.Text(); !strings.HasPrefix(got, tt.want) {
-				t.Fatalf("%s: got %q, want %q", tt.line, got, tt.want)
+			if got := scanner.Text(); !strings.HasPrefix(got, want) {
+				t.Fatalf("%s: got %q, want %q", tt.line, got, want)
 			}
 
 			// The connection is still in service.
@@ -84,3 +100,6 @@ func TestServer_KeywordLookalikesAreNotKeywords(t *testing.T) {
 		})
 	}
 }
+
+// asciiX replaces the non-ASCII look-alike letters with "X".
+var asciiX = strings.NewReplacer("ſ", "X", "ı", "X")
