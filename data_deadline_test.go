@@ -18,7 +18,8 @@ import (
 // number of bytes and the error the reader ended with.
 type contentSession struct {
 	ctxSession
-	got chan contentResult
+	got     chan contentResult
+	dataErr func(error) error
 }
 
 type contentResult struct {
@@ -29,6 +30,9 @@ type contentResult struct {
 func (s contentSession) Data(ctx context.Context, r io.Reader) error {
 	b, err := io.ReadAll(r)
 	s.got <- contentResult{len(b), err}
+	if s.dataErr != nil {
+		return s.dataErr(err)
+	}
 	return err
 }
 
@@ -43,6 +47,14 @@ type transferMode struct {
 	name string
 	lmtp bool
 	bdat bool
+
+	// The LMTP backend's session has no LMTPData: one status for all
+	// recipients, from Data.
+	plainSession bool
+
+	// What the backend's Data returns once it has read the content, given
+	// the reader's error; nil returns that error as it is.
+	dataErr func(error) error
 }
 
 var transferModes = []transferMode{
@@ -70,8 +82,8 @@ func startTransfer(t *testing.T, mode transferMode, configure func(*smtp.Server)
 		s.LMTP = mode.lmtp
 		s.Backend = smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
 			conns <- c
-			sess := contentSession{got: got}
-			if mode.lmtp {
+			sess := contentSession{got: got, dataErr: mode.dataErr}
+			if mode.lmtp && !mode.plainSession {
 				return contentLMTPSession{sess}, nil
 			}
 			return sess, nil
@@ -394,6 +406,97 @@ func TestBDATContentErrorIsTemporary(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// DATA content that cannot be read to its end fails temporarily too. The
+// backend's error is then the reader's own, handed back: answered as any
+// other backend error, "554 5.0.0 Error: transaction failed: read tcp ...",
+// it would make the client bounce a message it can deliver later, and show
+// it the connection's addresses.
+func TestDataContentErrorIsTemporary(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*smtp.Server)
+		send      func(net.Conn)
+	}{
+		{
+			name:      "ReadTimeout",
+			configure: func(s *smtp.Server) { s.ReadTimeout = 200 * time.Millisecond },
+			send:      func(conn net.Conn) { io.WriteString(conn, trickleLine) },
+		},
+		{
+			name: "DataTimeout",
+			configure: func(s *smtp.Server) {
+				s.ReadTimeout = time.Minute
+				s.DataTimeout = 300 * time.Millisecond
+			},
+			send: func(conn net.Conn) { go trickle(conn, 40, 50*time.Millisecond) },
+		},
+		{
+			name: "cut short",
+			send: func(conn net.Conn) {
+				io.WriteString(conn, trickleLine)
+				conn.(*net.TCPConn).CloseWrite()
+			},
+		},
+	}
+	modes := []transferMode{
+		{name: "DATA"},
+		{name: "LMTP DATA", lmtp: true},
+		{name: "LMTP DATA, Session only", lmtp: true, plainSession: true},
+	}
+	for _, mode := range modes {
+		for _, tc := range cases {
+			mode, tc := mode, tc
+			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				tt := startTransfer(t, mode, tc.configure)
+				tt.begin(0)
+				tc.send(tt.conn)
+
+				if r := tt.result(); r.err == nil {
+					t.Errorf("backend read %d bytes of content that was not sent to its end without an error", r.n)
+				}
+				if reply := tt.reply(); !strings.HasPrefix(reply, "421 4.4.2 ") {
+					t.Errorf("content that could not be read answered %q, want 421 4.4.2", reply)
+				}
+				if tt.scanner.Scan() {
+					t.Errorf("connection kept open after the content failed: read %q", tt.scanner.Text())
+				}
+			})
+		}
+	}
+}
+
+// A reply the backend chose itself for content it could not read is the
+// backend's to give: only an error without a reply of its own is the
+// server's to answer.
+func TestDataContentErrorKeepsBackendReply(t *testing.T) {
+	busy := func(error) error {
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Try again later"}
+	}
+	modes := []transferMode{
+		{name: "DATA", dataErr: busy},
+		{name: "LMTP DATA", lmtp: true, dataErr: busy},
+		{name: "LMTP DATA, Session only", lmtp: true, plainSession: true, dataErr: busy},
+	}
+	for _, mode := range modes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			tt := startTransfer(t, mode, func(s *smtp.Server) { s.ReadTimeout = 200 * time.Millisecond })
+			tt.begin(0)
+			io.WriteString(tt.conn, trickleLine)
+
+			tt.result()
+			if reply := tt.reply(); !strings.HasPrefix(reply, "451 4.3.0 ") {
+				t.Errorf("backend's reply to content it could not read: %q, want its 451 4.3.0", reply)
+			}
+			if tt.scanner.Scan() {
+				t.Errorf("connection kept open after the content failed: read %q", tt.scanner.Text())
+			}
+		})
 	}
 }
 
