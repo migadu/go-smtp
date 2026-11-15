@@ -8,9 +8,55 @@ import (
 	"time"
 )
 
-// cutPrefixFold is a version of strings.CutPrefix which is case-insensitive.
+// toUpperASCII returns s with its ASCII letters upper-cased and every other
+// byte unchanged. Command names, parameter names and keyword values are
+// case-insensitive over US-ASCII only: "ABNF strings are case insensitive and
+// the character set for these strings is US-ASCII" (RFC 5234 section 2.3).
+// strings.ToUpper would also map U+0131 (LATIN SMALL LETTER DOTLESS I) to "I"
+// and U+017F (LATIN SMALL LETTER LONG S) to "S", turning a look-alike such as
+// "MAıL" into a command.
+func toUpperASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if 'a' <= s[i] && s[i] <= 'z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'a' <= b[j] && b[j] <= 'z' {
+					b[j] -= 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
+// equalFoldASCII reports whether s and t are equal when ASCII letters are
+// compared case-insensitively and every other byte exactly. Unlike
+// strings.EqualFold it does not take U+017F (LATIN SMALL LETTER LONG S) for
+// "s" or U+212A (KELVIN SIGN) for "k"; see toUpperASCII.
+func equalFoldASCII(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if 'a' <= a && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if 'a' <= b && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+// cutPrefixFold is a version of strings.CutPrefix which is case-insensitive
+// over ASCII letters (see equalFoldASCII).
 func cutPrefixFold(s, prefix string) (string, bool) {
-	if len(s) < len(prefix) || !strings.EqualFold(s[:len(prefix)], prefix) {
+	if len(s) < len(prefix) || !equalFoldASCII(s[:len(prefix)], prefix) {
 		return "", false
 	}
 	return s[len(prefix):], true
@@ -52,7 +98,7 @@ func parseCmd(line string) (cmd string, arg string, err error) {
 		if len(line) < 4 {
 			return "", "", fmt.Errorf("command too short: %q", line)
 		}
-		return strings.ToUpper(line), "", nil
+		return toUpperASCII(line), "", nil
 	}
 
 	// Space found, split into command and arguments
@@ -60,7 +106,7 @@ func parseCmd(line string) (cmd string, arg string, err error) {
 		return "", "", fmt.Errorf("command too short: %q", line)
 	}
 
-	command := strings.ToUpper(line[:spaceIndex])
+	command := toUpperASCII(line[:spaceIndex])
 	arguments := strings.TrimSpace(line[spaceIndex+1:])
 
 	return command, arguments, nil
@@ -81,9 +127,9 @@ func parseArgs(s string) (map[string]string, error) {
 		// or an ORCPT address).
 		key, value, found := strings.Cut(arg, "=")
 		if found {
-			argMap[strings.ToUpper(key)] = value
+			argMap[toUpperASCII(key)] = value
 		} else {
-			argMap[strings.ToUpper(key)] = ""
+			argMap[toUpperASCII(key)] = ""
 		}
 	}
 	return argMap, nil

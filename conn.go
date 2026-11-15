@@ -154,7 +154,7 @@ func (c *Conn) handle(cmd string, arg string) {
 		return
 	}
 
-	cmd = strings.ToUpper(cmd)
+	cmd = toUpperASCII(cmd)
 	switch cmd {
 	case "SEND", "SOML", "SAML", "EXPN", "HELP", "TURN":
 		// These commands are not implemented in any state
@@ -717,7 +717,7 @@ func (c *Conn) handleMail(arg string) {
 			}
 			opts.RequireTLS = true
 		case "BODY":
-			value = strings.ToUpper(value)
+			value = toUpperASCII(value)
 			switch BodyType(value) {
 			case BodyBinaryMIME:
 				if !c.server.EnableBINARYMIME {
@@ -737,7 +737,7 @@ func (c *Conn) handleMail(arg string) {
 				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RET is not implemented")
 				return
 			}
-			value = strings.ToUpper(value)
+			value = toUpperASCII(value)
 			switch DSNReturn(value) {
 			case DSNReturnFull, DSNReturnHeaders:
 				// This space is intentionally left blank
@@ -951,7 +951,7 @@ func decodeTypedAddress(val string) (DSNAddressType, string, error) {
 	if len(tv) != 2 || tv[0] == "" || tv[1] == "" {
 		return "", "", errors.New("bad address")
 	}
-	aType, aAddr := strings.ToUpper(tv[0]), tv[1]
+	aType, aAddr := toUpperASCII(tv[0]), tv[1]
 
 	var err error
 	switch DSNAddressType(aType) {
@@ -1102,7 +1102,7 @@ func (c *Conn) handleRcpt(arg string) {
 			}
 			notify := []DSNNotify{}
 			for _, val := range strings.Split(value, ",") {
-				notify = append(notify, DSNNotify(strings.ToUpper(val)))
+				notify = append(notify, DSNNotify(toUpperASCII(val)))
 			}
 			if err := checkNotifySet(notify); err != nil {
 				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed NOTIFY parameter value")
@@ -1225,7 +1225,7 @@ func (c *Conn) handleAuth(arg string) {
 		return
 	}
 
-	mechanism := strings.ToUpper(parts[0])
+	mechanism := toUpperASCII(parts[0])
 
 	// Parse client initial response if there is one
 	var ir []byte
@@ -1509,7 +1509,7 @@ func (c *Conn) handleBdat(arg string) {
 
 	last := false
 	if len(args) == 2 {
-		if !strings.EqualFold(args[1], "LAST") {
+		if !equalFoldASCII(args[1], "LAST") {
 			refuse(size, 501, EnhancedCode{5, 5, 4}, "Unknown BDAT argument")
 			return
 		}
@@ -2203,7 +2203,7 @@ func (c *Conn) parseXCLIENTArgs(arg string) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid attribute format: %s", field)
 		}
 
-		name := strings.ToUpper(parts[0])
+		name := toUpperASCII(parts[0])
 		value := parts[1]
 
 		attrs[name] = value
@@ -2237,8 +2237,8 @@ func (c *Conn) validateXCLIENTAttrs(attrs map[string]string) error {
 		switch name {
 		case "ADDR":
 			addrValue := value
-			if strings.HasPrefix(strings.ToLower(addrValue), "ipv6:") {
-				addrValue = addrValue[5:]
+			if rest, ok := cutPrefixFold(addrValue, "IPV6:"); ok {
+				addrValue = rest
 			}
 			if net.ParseIP(addrValue) == nil {
 				return fmt.Errorf("invalid IP address for ADDR: %s", value)
@@ -2249,7 +2249,7 @@ func (c *Conn) validateXCLIENTAttrs(attrs map[string]string) error {
 			}
 		case "PROTO":
 			validProtos := map[string]bool{"SMTP": true, "ESMTP": true, "LMTP": true}
-			if !validProtos[strings.ToUpper(value)] {
+			if !validProtos[toUpperASCII(value)] {
 				return fmt.Errorf("invalid protocol for PROTO: %s", value)
 			}
 		case "HELO", "LOGIN", "NAME":
