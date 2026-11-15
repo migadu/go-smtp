@@ -174,6 +174,7 @@ func TestServer_LMTPBDATLastWithoutRecipientsChunkCutShort(t *testing.T) {
 	}
 }
 
+// Outside that one state a BDAT without an accepted recipient keeps its single
 // refusal: a chunk that is not the last one (RFC 3030 section 2: "A 250
 // response MUST be sent to each successful BDAT data block"; this one is not
 // successful), BDAT in SMTP, where the zero-reply rule does not exist, and
