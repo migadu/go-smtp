@@ -74,6 +74,9 @@ type Conn struct {
 	bdatStatus    *statusCollector   // used for BDAT on LMTP
 	dataResult    chan error
 	bytesReceived int64 // counts total size of chunks when BDAT is used
+	// A BDAT chunk was refused, but the transaction was left open for the
+	// BDAT LAST that gets no reply in LMTP; see handleBdat.
+	bdatFailed bool
 
 	fromReceived bool
 	recipients   []string
@@ -1024,6 +1027,13 @@ func (c *Conn) handleRcpt(arg string) {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
+	// RFC 3030 section 2: after a refused BDAT "the transaction should be
+	// considered failed". A recipient accepted now would let a BDAT LAST
+	// complete a message that lacks the refused chunk.
+	if c.bdatFailed {
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed after a refused BDAT")
+		return
+	}
 
 	arg, ok := cutPrefixFold(arg, "TO:")
 	if !ok {
@@ -1429,12 +1439,12 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.withCommandContext(func(ctx context.Context) error {
+	err := c.withCommandContext(func(ctx context.Context) error {
 		return c.Session().Data(ctx, r)
-	}))
+	})
 	r.limited = false
 	io.Copy(io.Discard, r) // Make sure all the data has been consumed
-	c.writeResponse(code, enhancedCode, msg)
+	c.writeResponse(contentErrorToStatus(err, r.r.failed()))
 	if err := r.r.err; err != nil { // the content could not be read to its end
 		c.endAfterContentError(err)
 	}
@@ -1515,12 +1525,14 @@ func (c *Conn) handleBdat(arg string) {
 		//
 		// A chunk before the last one is refused, one reply, but unlike other
 		// refusals it leaves the transaction open: the client still counts
-		// zero replies for the BDAT LAST it pipelined behind this chunk.
+		// zero replies for the BDAT LAST it pipelined behind this chunk. The
+		// transaction has failed all the same, and takes no more recipients.
 		readErr := discard(size)
 		if last {
 			c.reset()
 		} else {
 			c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+			c.bdatFailed = true
 		}
 		if readErr != nil {
 			c.endAfterContentError(readErr)
@@ -1785,7 +1797,10 @@ func (c *Conn) handleDataLMTP() {
 	}
 
 	for i, rcpt := range c.recipients {
-		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
+		err := <-status.status[i]
+		// The backend may still be reading the content: r.r.err is its to
+		// touch until done.
+		code, enchCode, msg := contentErrorToStatus(err, r.r.failed())
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
 
@@ -1796,6 +1811,24 @@ func (c *Conn) handleDataLMTP() {
 	} else if err := r.r.err; err != nil {
 		c.endAfterContentError(err)
 	}
+}
+
+// contentErrorToStatus is dataErrorToStatus for the backend's answer to a DATA
+// body. When the body could not be read to its end (contentFailed), a backend
+// error without a reply of its own is as a rule that read error handed back.
+// Answered like any other, "554 5.0.0 Error: transaction failed: read tcp
+// ...", it would make the client bounce a message it can deliver later and
+// show it the connection's addresses: failing to receive the content is
+// temporary and says nothing about the message. It gets the reply a BDAT
+// chunk that cannot be read gets. A reply the backend chose itself, an
+// *SMTPError, is kept.
+func contentErrorToStatus(err error, contentFailed bool) (code int, enchCode EnhancedCode, msg string) {
+	if err != nil && contentFailed {
+		if _, ok := err.(*SMTPError); !ok {
+			return 421, EnhancedCode{4, 4, 2}, "Error reading message data, closing connection"
+		}
+	}
+	return dataErrorToStatus(err)
 }
 
 func dataErrorToStatus(err error) (code int, enchCode EnhancedCode, msg string) {
@@ -2273,6 +2306,7 @@ func (c *Conn) resetState() Session {
 		c.bdatCtxCancel = nil
 	}
 	c.bdatStatus = nil
+	c.bdatFailed = false
 	c.bytesReceived = 0
 	c.fromReceived = false
 	c.recipients = nil

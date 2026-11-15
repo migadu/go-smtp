@@ -23,9 +23,31 @@ func (s refuseEveryRcptSession) Rcpt(ctx context.Context, to string, opts *smtp.
 	return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "No such user"}
 }
 
+// refuseNobodySession refuses the recipient of zeroRcptRefused and accepts
+// every other one.
+type refuseNobodySession struct {
+	*session
+}
+
+func (s refuseNobodySession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
+	if to == "nobody@example.com" {
+		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "No such user"}
+	}
+	return s.session.Rcpt(ctx, to, opts)
+}
+
 // startZeroRcptTest connects to a new server whose backend refuses every
 // recipient, greets it, and sends each of before, expecting its reply code.
 func startZeroRcptTest(t *testing.T, lmtp bool, before [][2]string) (*backend, io.Writer, *bufio.Reader) {
+	t.Helper()
+	return startRcptPolicyTest(t, lmtp, func(sess *session) smtp.Session {
+		return refuseEveryRcptSession{sess}
+	}, before)
+}
+
+// startRcptPolicyTest is startZeroRcptTest with the session that decides on
+// the recipients given by wrap.
+func startRcptPolicyTest(t *testing.T, lmtp bool, wrap func(*session) smtp.Session, before [][2]string) (*backend, io.Writer, *bufio.Reader) {
 	t.Helper()
 	be, s, c, _ := testServer(t, func(s *smtp.Server) {
 		s.LMTP = lmtp
@@ -35,7 +57,7 @@ func startZeroRcptTest(t *testing.T, lmtp bool, before [][2]string) (*backend, i
 			if err != nil {
 				return nil, err
 			}
-			return refuseEveryRcptSession{sess.(*session)}, nil
+			return wrap(sess.(*session)), nil
 		})
 	})
 	t.Cleanup(func() {
@@ -174,6 +196,41 @@ func TestServer_LMTPBDATLastWithoutRecipientsChunkCutShort(t *testing.T) {
 	}
 }
 
+// The refused chunk leaves the transaction open only for that BDAT LAST. The
+// transaction itself has failed (RFC 3030 section 2: "If a 5XX or 4XX code is
+// received by the sender-SMTP in response to a BDAT chunk, the transaction
+// should be considered failed"): a recipient accepted now would let a BDAT
+// LAST complete a message that lacks the refused chunk.
+func TestServer_LMTPRcptAfterRefusedChunk(t *testing.T) {
+	be, c, r := startRcptPolicyTest(t, true, func(sess *session) smtp.Session {
+		return refuseNobodySession{sess}
+	}, [][2]string{zeroRcptMail, zeroRcptRefused})
+
+	// One write: the client does not wait for the refusal.
+	io.WriteString(c, "BDAT 5\r\nHelloRCPT TO:<rcpt@example.com>\r\nBDAT 1 LAST\r\n!NOOP\r\n")
+	if line := zeroRcptReadReply(t, r); !isBadSequenceReply(line) {
+		t.Fatalf("BDAT 5: %q, want a bad-sequence refusal", line)
+	}
+	if line := zeroRcptReadReply(t, r); !strings.HasPrefix(line, "503 5.5.1 ") {
+		t.Fatalf("RCPT after the refused chunk: %q, want 503 5.5.1 (the transaction has failed)", line)
+	}
+	if line := zeroRcptReadReply(t, r); line != zeroRcptNoopReply {
+		t.Fatalf("first reply after BDAT LAST: %q, want the NOOP reply %q", line, zeroRcptNoopReply)
+	}
+	if n := len(be.messages) + len(be.anonmsgs); n != 0 {
+		t.Fatalf("delivered %d messages, want none: the message lacks the refused chunk", n)
+	}
+
+	// The next transaction takes the recipient.
+	for _, cmd := range []string{"MAIL FROM:<sender@example.org>", "RCPT TO:<rcpt@example.com>"} {
+		io.WriteString(c, cmd+"\r\n")
+		if line := zeroRcptReadReply(t, r); !strings.HasPrefix(line, "250 ") {
+			t.Fatalf("%s in the next transaction: %q, want 250", cmd, line)
+		}
+	}
+}
+
+// Outside that one state a BDAT without an accepted recipient keeps its single
 // refusal: a chunk that is not the last one (RFC 3030 section 2: "A 250
 // response MUST be sent to each successful BDAT data block"; this one is not
 // successful), BDAT in SMTP, where the zero-reply rule does not exist, and
