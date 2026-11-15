@@ -1563,11 +1563,14 @@ func (c *Conn) handleBdat(arg string) {
 		var r *io.PipeReader
 		r, c.bdatPipe = io.Pipe()
 
-		c.dataResult = make(chan error, 1)
+		dataResult := make(chan error, 1)
+		c.dataResult = dataResult
 
 		// The data goroutine runs concurrently with the serve loop, which can
 		// abort the transfer (RSET, Close) and clear connection state under
 		// c.locker; give the goroutine stable copies instead of Conn fields.
+		// Its result channel also belongs to this transfer: an aborted backend
+		// call may return after the next transaction replaces c.dataResult.
 		recipients := append([]string(nil), c.recipients...)
 		bdatStatus := c.bdatStatus
 
@@ -1587,7 +1590,7 @@ func (c *Conn) handleBdat(arg string) {
 				if err := recover(); err != nil {
 					c.handlePanic(err, bdatStatus)
 
-					c.dataResult <- errPanic
+					dataResult <- errPanic
 					r.CloseWithError(errPanic)
 				}
 			}()
@@ -1607,7 +1610,7 @@ func (c *Conn) handleBdat(arg string) {
 				}
 			}
 
-			c.dataResult <- err
+			dataResult <- err
 			r.CloseWithError(err)
 		}()
 	}
