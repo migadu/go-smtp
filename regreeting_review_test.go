@@ -249,7 +249,7 @@ func TestAuthenticatedGreetingRetainsSessionAndChecksPolicy(t *testing.T) {
 			if len(sess.getChecked()) != 2 || sess.conn.Hostname() != "accepted.example" || sess.conn.Greeting() != command {
 				t.Fatal("authenticated re-greeting bypassed the policy or lost the new greeting")
 			}
-			send("DATA", "502") // accepted greeting cleared the previous envelope
+			send("DATA", "503") // accepted greeting cleared the previous envelope
 			send("AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk", "503")
 			send("MAIL FROM:<sender@example.com>", "250")
 			send("RCPT TO:<recipient@example.com>", "250")
