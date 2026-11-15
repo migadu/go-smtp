@@ -570,8 +570,8 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.EnableDSN {
 		caps = append(caps, "DSN")
 	}
-	if c.server.MaxMessageBytes > 0 {
-		caps = append(caps, fmt.Sprintf("SIZE %v", c.server.MaxMessageBytes))
+	if limit := c.server.maxMessageBytes(); limit > 0 {
+		caps = append(caps, fmt.Sprintf("SIZE %v", limit))
 	} else {
 		caps = append(caps, "SIZE")
 	}
@@ -642,12 +642,17 @@ func (c *Conn) helloReplyLine(clientDomain string) string {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
+	// Out of sequence, not unimplemented: 503. RFC 5321 section 4.1.1.1: "a
+	// client MUST issue HELO or EHLO before starting a mail transaction";
+	// section 4.3.2 lists 503, not 502, among the error replies to MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
+	// A BDAT transfer belongs to an open transaction: a bad sequence, like
+	// the nested MAIL below.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
 		return
 	}
 	// RFC 5321 section 4.1.1.2: MAIL is only permitted when there is no
@@ -690,7 +695,7 @@ func (c *Conn) handleMail(arg string) {
 				return
 			}
 
-			if tooLarge || c.server.MaxMessageBytes > 0 && size > c.server.MaxMessageBytes {
+			if limit := c.server.maxMessageBytes(); tooLarge || limit > 0 && size > limit {
 				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 				return
 			}
@@ -1006,12 +1011,17 @@ func isPrintableASCII(val string) bool {
 
 // MAIL state -> waiting for RCPTs followed by DATA
 func (c *Conn) handleRcpt(arg string) {
+	// RFC 5321 section 3.3: "If a RCPT command appears without a previous
+	// MAIL command, the server MUST return a 503 "Bad sequence of commands"
+	// response."
 	if !c.fromReceived {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
+	// RFC 3030 section 2 sends BDAT "After all MAIL and RCPT responses are
+	// collected and processed": a RCPT after it is out of sequence.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
 
@@ -1172,8 +1182,9 @@ func checkNotifySet(values []DSNNotify) error {
 }
 
 func (c *Conn) handleAuth(arg string) {
+	// AUTH is negotiated by EHLO; before it, a bad sequence (503) as for MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.didAuth {
@@ -1389,17 +1400,21 @@ func (c *Conn) handleData(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "DATA command should not have any arguments")
 		return
 	}
+	// RFC 3030 sections 2 and 3: DATA after a BDAT of the current
+	// transaction, or after MAIL BODY=BINARYMIME, MUST get 503.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
 		return
 	}
 	if c.binarymime {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
 		return
 	}
 
+	// RFC 5321 section 3.3 allows 503 or 554 for DATA without MAIL or an
+	// accepted RCPT; RFC 2033 section 4.2 requires 503 in LMTP.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1433,8 +1448,10 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
+	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
+	// which ended the transaction: RFC 3030 section 2 requires 503 for it.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1465,7 +1482,7 @@ func (c *Conn) handleBdat(arg string) {
 	// Compared without adding to bytesReceived, which an accepted chunk
 	// never takes past the limit, so that a size near the largest int64
 	// cannot overflow the check.
-	if c.server.MaxMessageBytes != 0 && size > c.server.MaxMessageBytes-c.bytesReceived {
+	if limit := c.server.maxMessageBytes(); limit > 0 && size > limit-c.bytesReceived {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
@@ -1672,6 +1689,7 @@ func (c *Conn) handleDataLMTP() {
 		err := c.withCommandContext(func(ctx context.Context) error {
 			return c.Session().Data(ctx, r)
 		})
+		r.limited = false
 		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1696,6 +1714,7 @@ func (c *Conn) handleDataLMTP() {
 			status.fillRemaining(c.withCommandContext(func(ctx context.Context) error {
 				return lmtpSession.LMTPData(ctx, r, status)
 			}))
+			r.limited = false
 			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
