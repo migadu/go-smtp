@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"time"
 )
 
 type EnhancedCode [3]int
@@ -47,35 +48,102 @@ var ErrDataTooLarge = &SMTPError{
 	Message:      "Maximum message size exceeded",
 }
 
+// contentReader reads message content, a DATA body or a BDAT chunk, from the
+// connection. ReadTimeout bounds each wait for more content rather than the
+// whole transfer: RFC 5321 section 4.5.3.2 sets "a timer ... for each buffer
+// of the data transfer", so that "the overall timeout is inherently
+// proportional to the size of the message". Before every read that has to
+// wait for the client, the read deadline is re-armed, capped by the session
+// deadline and by Server.DataTimeout counted from the start of the content.
+//
+// The first error is final: the stream is no longer at a known position, so
+// the transfer cannot be resumed. The end of the connection is such an error
+// (io.ErrUnexpectedEOF), since content ends at its end-of-data marker or at
+// the chunk size, never at EOF.
+type contentReader struct {
+	c        *Conn
+	r        *bufio.Reader
+	deadline time.Time // start + Server.DataTimeout; zero if unset
+	err      error
+}
+
+func newContentReader(c *Conn) *contentReader {
+	cr := &contentReader{c: c, r: c.text.R}
+	if d := c.server.DataTimeout; d != 0 {
+		cr.deadline = time.Now().Add(d)
+	}
+	return cr
+}
+
+// wait arms the read deadline when the next read has to wait for the client.
+func (cr *contentReader) wait() error {
+	if cr.r.Buffered() > 0 {
+		return nil
+	}
+	return cr.c.armReadDeadline(cr.deadline)
+}
+
+func (cr *contentReader) fail(err error) error {
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	cr.err = err
+	return err
+}
+
+func (cr *contentReader) ReadByte() (byte, error) {
+	if cr.err != nil {
+		return 0, cr.err
+	}
+	if err := cr.wait(); err != nil {
+		return 0, cr.fail(err)
+	}
+	b, err := cr.r.ReadByte()
+	if err != nil {
+		return 0, cr.fail(err)
+	}
+	return b, nil
+}
+
+func (cr *contentReader) Read(p []byte) (int, error) {
+	if cr.err != nil {
+		return 0, cr.err
+	}
+	if err := cr.wait(); err != nil {
+		return 0, cr.fail(err)
+	}
+	n, err := cr.r.Read(p)
+	if err != nil {
+		return n, cr.fail(err)
+	}
+	return n, nil
+}
+
 type dataReader struct {
-	r     *bufio.Reader
+	r     *contentReader
 	state int
 
-	limited bool
-	n       int64 // Maximum bytes remaining
+	limited  bool
+	n        int64 // Maximum bytes remaining
+	tooLarge bool  // A message octet beyond the limit was read
 }
 
 func newDataReader(c *Conn) *dataReader {
 	dr := &dataReader{
-		r: c.text.R,
+		r: newContentReader(c),
 	}
 
-	if c.server.MaxMessageBytes > 0 {
+	if limit := c.server.maxMessageBytes(); limit > 0 {
 		dr.limited = true
-		dr.n = int64(c.server.MaxMessageBytes)
+		dr.n = limit
 	}
 
 	return dr
 }
 
 func (r *dataReader) Read(b []byte) (n int, err error) {
-	if r.limited {
-		if r.n <= 0 {
-			return 0, ErrDataTooLarge
-		}
-		if int64(len(b)) > r.n {
-			b = b[0:r.n]
-		}
+	if r.limited && r.tooLarge {
+		return 0, ErrDataTooLarge
 	}
 
 	// Code below is taken from net/textproto with only one modification to
@@ -95,9 +163,6 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 		var c byte
 		c, err = r.r.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
 			break
 		}
 		switch r.state {
@@ -133,6 +198,15 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 			if c == '\r' {
 				r.state = stateCR
 			}
+		}
+		if r.limited && int64(n) == r.n {
+			// A message octet beyond the limit. Checked here rather than by
+			// shortening b, so that the end-of-data line after a message of
+			// exactly the limit is still read: it is not part of the message
+			// size (RFC 1870 section 5).
+			r.tooLarge = true
+			err = ErrDataTooLarge
+			break
 		}
 		b[n] = c
 		n++

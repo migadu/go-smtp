@@ -88,9 +88,9 @@ func TestServer_BDATRefusedChunkDiscarded(t *testing.T) {
 		args            string // after the chunk size
 		reply           string
 	}{
-		{"no MAIL", false, 0, nil, " LAST", "502 5.5.1 "},
-		{"no RCPT", false, 0, bdatTransaction[:1], " LAST", "502 5.5.1 "},
-		{"no RCPT, LMTP", true, 0, bdatTransaction[:1], " LAST", "502 5.5.1 "},
+		{"no MAIL", false, 0, nil, " LAST", "503 5.5.1 "},
+		{"no RCPT", false, 0, bdatTransaction[:1], " LAST", "503 5.5.1 "},
+		{"no RCPT, LMTP", true, 0, bdatTransaction[:1], " LAST", "503 5.5.1 "},
 		{"too many arguments", false, 0, bdatTransaction, " LAST LAST", "501 5.5.4 "},
 		{"unknown argument", false, 0, bdatTransaction, " FIRST", "501 5.5.4 "},
 		{"over MaxMessageBytes", false, 10, bdatTransaction, " LAST", "552 5.3.4 "},
@@ -119,7 +119,7 @@ func TestServer_BDATRefusedChunkDiscardedBeforeReply(t *testing.T) {
 		before          []string
 		reply           string
 	}{
-		{"no RCPT", 0, bdatTransaction[:1], "502 5.5.1 "},
+		{"no RCPT", 0, bdatTransaction[:1], "503 5.5.1 "},
 		{"over MaxMessageBytes", 10, bdatTransaction, "552 5.3.4 "},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

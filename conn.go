@@ -570,8 +570,8 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.EnableDSN {
 		caps = append(caps, "DSN")
 	}
-	if c.server.MaxMessageBytes > 0 {
-		caps = append(caps, fmt.Sprintf("SIZE %v", c.server.MaxMessageBytes))
+	if limit := c.server.maxMessageBytes(); limit > 0 {
+		caps = append(caps, fmt.Sprintf("SIZE %v", limit))
 	} else {
 		caps = append(caps, "SIZE")
 	}
@@ -642,12 +642,17 @@ func (c *Conn) helloReplyLine(clientDomain string) string {
 
 // READY state -> waiting for MAIL
 func (c *Conn) handleMail(arg string) {
+	// Out of sequence, not unimplemented: 503. RFC 5321 section 4.1.1.1: "a
+	// client MUST issue HELO or EHLO before starting a mail transaction";
+	// section 4.3.2 lists 503, not 502, among the error replies to MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
+	// A BDAT transfer belongs to an open transaction: a bad sequence, like
+	// the nested MAIL below.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
 		return
 	}
 	// RFC 5321 section 4.1.1.2: MAIL is only permitted when there is no
@@ -684,18 +689,18 @@ func (c *Conn) handleMail(arg string) {
 	for key, value := range args {
 		switch key {
 		case "SIZE":
-			size, err := strconv.ParseUint(value, 10, 32)
+			size, tooLarge, err := parseSize(value)
 			if err != nil {
 				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse SIZE as an integer")
 				return
 			}
 
-			if c.server.MaxMessageBytes > 0 && int64(size) > c.server.MaxMessageBytes {
+			if limit := c.server.maxMessageBytes(); tooLarge || limit > 0 && size > limit {
 				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 				return
 			}
 
-			opts.Size = int64(size)
+			opts.Size = size
 		case "SMTPUTF8":
 			if !c.server.EnableSMTPUTF8 {
 				c.writeResponse(504, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
@@ -1006,12 +1011,17 @@ func isPrintableASCII(val string) bool {
 
 // MAIL state -> waiting for RCPTs followed by DATA
 func (c *Conn) handleRcpt(arg string) {
+	// RFC 5321 section 3.3: "If a RCPT command appears without a previous
+	// MAIL command, the server MUST return a 503 "Bad sequence of commands"
+	// response."
 	if !c.fromReceived {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing MAIL FROM command.")
 		return
 	}
+	// RFC 3030 section 2 sends BDAT "After all MAIL and RCPT responses are
+	// collected and processed": a RCPT after it is out of sequence.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
 
@@ -1172,8 +1182,9 @@ func checkNotifySet(values []DSNNotify) error {
 }
 
 func (c *Conn) handleAuth(arg string) {
+	// AUTH is negotiated by EHLO; before it, a bad sequence (503) as for MAIL.
 	if c.Hostname() == "" {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Please introduce yourself first.")
 		return
 	}
 	if c.didAuth {
@@ -1389,17 +1400,21 @@ func (c *Conn) handleData(arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 4}, "DATA command should not have any arguments")
 		return
 	}
+	// RFC 3030 sections 2 and 3: DATA after a BDAT of the current
+	// transaction, or after MAIL BODY=BINARYMIME, MUST get 503.
 	if c.bdatPipe != nil {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
 		return
 	}
 	if c.binarymime {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed for BINARYMIME messages")
 		return
 	}
 
+	// RFC 5321 section 3.3 allows 503 or 554 for DATA without MAIL or an
+	// accepted RCPT; RFC 2033 section 4.2 requires 503 in LMTP.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		c.writeResponse(503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
@@ -1420,6 +1435,9 @@ func (c *Conn) handleData(arg string) {
 	r.limited = false
 	io.Copy(io.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
+	if err := r.r.err; err != nil { // the content could not be read to its end
+		c.endAfterContentError(err)
+	}
 }
 
 func (c *Conn) handleBdat(arg string) {
@@ -1436,10 +1454,17 @@ func (c *Conn) handleBdat(arg string) {
 	// discard additional BDAT chunks already in the pipeline after the failed
 	// BDAT". Left open, the transaction would take a BDAT pipelined behind
 	// this one as its next chunk and deliver a message without this chunk.
-	refuse := func(chunkSize uint64, code int, enhCode EnhancedCode, text string) {
-		io.Copy(io.Discard, io.LimitReader(c.text.R, int64(chunkSize)))
+	//
+	// A chunk that cannot be read to its end still gets the refusal, and the
+	// connection is then closed: what follows cannot be told from commands.
+	refuse := func(chunkSize int64, code int, enhCode EnhancedCode, text string) {
+		cr := newContentReader(c)
+		io.Copy(io.Discard, io.LimitReader(cr, chunkSize))
 		c.writeResponse(code, enhCode, text)
 		c.reset()
+		if cr.err != nil {
+			c.endAfterContentError(cr.err)
+		}
 	}
 
 	// Without a size there is no length to discard.
@@ -1449,10 +1474,17 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	// ParseUint instead of Atoi so we will not accept negative values.
-	size, err := strconv.ParseUint(args[0], 10, 32)
+	size, tooLarge, err := parseSize(args[0])
 	if err != nil {
 		refuse(0, 501, EnhancedCode{5, 5, 4}, "Malformed size argument")
+		return
+	}
+
+	if tooLarge {
+		// A chunk this large cannot be discarded, and the rest of the
+		// connection would be read as commands.
+		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded, closing connection")
+		c.Close()
 		return
 	}
 
@@ -1470,12 +1502,17 @@ func (c *Conn) handleBdat(arg string) {
 		last = true
 	}
 
+	// A bad sequence, as for DATA. This also answers a BDAT after BDAT LAST,
+	// which ended the transaction: RFC 3030 section 2 requires 503 for it.
 	if !c.fromReceived || len(c.recipients) == 0 {
-		refuse(size, 502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		refuse(size, 503, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
+	// Compared without adding to bytesReceived, which an accepted chunk
+	// never takes past the limit, so that a size near the largest int64
+	// cannot overflow the check.
+	if limit := c.server.maxMessageBytes(); limit > 0 && size > limit-c.bytesReceived {
 		refuse(size, 552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 		return
 	}
@@ -1537,24 +1574,35 @@ func (c *Conn) handleBdat(arg string) {
 		}()
 	}
 
-	chunk := io.LimitReader(c.text.R, int64(size))
+	cr := newContentReader(c)
+	chunk := io.LimitReader(cr, size)
 	_, err = io.Copy(c.bdatPipe, chunk)
 	if err != nil {
-		// Backend might return an error early using CloseWithError without consuming
-		// the whole chunk.
+		// Either the chunk could not be read, or the backend returned an error
+		// early using CloseWithError without consuming the whole chunk.
+		readErr := cr.err
 		io.Copy(io.Discard, chunk)
 
-		c.writeResponse(dataErrorToStatus(err))
+		if readErr != nil {
+			// The reply is the server's, not the backend's: failing to receive
+			// the chunk is temporary and says nothing about the message, so a
+			// 5xx here would make the client bounce mail it can deliver later.
+			c.writeResponse(421, EnhancedCode{4, 4, 2}, "Error reading message data, closing connection")
+		} else {
+			c.writeResponse(dataErrorToStatus(err))
+		}
 
 		if err == errPanic {
 			c.Close()
+		} else if cr.err != nil {
+			c.endAfterContentError(cr.err)
 		}
 
 		c.reset()
 		return
 	}
 
-	c.bytesReceived += int64(size)
+	c.bytesReceived += size
 
 	if last {
 		c.bdatPipe.Close()
@@ -1677,6 +1725,7 @@ func (c *Conn) handleDataLMTP() {
 		err := c.withCommandContext(func(ctx context.Context) error {
 			return c.Session().Data(ctx, r)
 		})
+		r.limited = false
 		io.Copy(io.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
@@ -1701,6 +1750,9 @@ func (c *Conn) handleDataLMTP() {
 			status.fillRemaining(c.withCommandContext(func(ctx context.Context) error {
 				return lmtpSession.LMTPData(ctx, r, status)
 			}))
+			// Consume the rest of a message over MaxMessageBytes as well,
+			// as handleData does: it is still content, not commands.
+			r.limited = false
 			io.Copy(io.Discard, r) // Make sure all the data has been consumed
 			done <- true
 		}()
@@ -1715,6 +1767,8 @@ func (c *Conn) handleDataLMTP() {
 	// should be closed.
 	if !<-done {
 		c.Close()
+	} else if err := r.r.err; err != nil {
+		c.endAfterContentError(err)
 	}
 }
 
@@ -1804,21 +1858,48 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 	}
 }
 
-// Reads a line of input, enforcing Server.MaxLineLength on the line itself
-// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
-// chunk following its command — do not count toward the limit.
-func (c *Conn) readLine() (string, error) {
+// armReadDeadline sets the deadline for the next read of client input:
+// ReadTimeout from now, capped by the session deadline and by limit, if
+// non-zero. When nothing bounds the read it leaves the connection's deadline
+// alone, unless one may have been set before (a session deadline since
+// disabled, or a DataTimeout), which it clears.
+func (c *Conn) armReadDeadline(limit time.Time) error {
 	deadline, configured := c.getSessionDeadline()
+	if !limit.IsZero() && (deadline.IsZero() || limit.Before(deadline)) {
+		deadline = limit
+	}
 	if c.server.ReadTimeout != 0 {
 		idleDeadline := time.Now().Add(c.server.ReadTimeout)
 		if deadline.IsZero() || idleDeadline.Before(deadline) {
 			deadline = idleDeadline
 		}
 	}
-	if configured || !deadline.IsZero() {
-		if err := c.conn.SetReadDeadline(deadline); err != nil {
-			return "", err
+	if configured || !deadline.IsZero() || c.server.DataTimeout != 0 {
+		return c.conn.SetReadDeadline(deadline)
+	}
+	return nil
+}
+
+// endAfterContentError closes the connection once message content could not be
+// read to its end, after the transaction's reply has been written. The rest of
+// the client's input can no longer be told apart from commands, and RFC 5321
+// section 3.8 lets the server close "after a timeout ... occurs waiting for the
+// client to send a command or data".
+func (c *Conn) endAfterContentError(err error) {
+	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+		if h := c.server.OnTimeout; h != nil {
+			h()
 		}
+	}
+	c.Close()
+}
+
+// Reads a line of input, enforcing Server.MaxLineLength on the line itself
+// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
+// chunk following its command — do not count toward the limit.
+func (c *Conn) readLine() (string, error) {
+	if err := c.armReadDeadline(time.Time{}); err != nil {
+		return "", err
 	}
 
 	var line []byte
