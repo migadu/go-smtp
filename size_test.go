@@ -80,6 +80,63 @@ func TestServer_MAILSizeBeyond32Bits(t *testing.T) {
 	}
 }
 
+// RFC 1870 section 3 (4) bounds the SIZE value: "size-value ::= 1*20DIGIT".
+// A longer one is a syntax error, 501, even when leading zeros leave a small
+// number, in SMTP and LMTP alike.
+func TestServer_MAILSizeLongerThan20Digits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size string
+		want string
+	}{
+		{"20 digits with leading zeros", "00000000000000000001", "250 "},
+		{"21 digits with leading zeros", "000000000000000000001", "501 5.5.4 "},
+		{"21 digits", "123456789012345678901", "501 5.5.4 "},
+	} {
+		for _, lmtp := range []bool{false, true} {
+			name := tc.name
+			if lmtp {
+				name += " in LMTP"
+			}
+			t.Run(name, func(t *testing.T) {
+				var s *smtp.Server
+				var c net.Conn
+				var scanner *bufio.Scanner
+				if lmtp {
+					_, s, c, scanner = testServerGreetedLMTP(t, func(s *smtp.Server) { s.LMTP = true })
+					sendLHLO(t, scanner, c)
+				} else {
+					_, s, c, scanner, _ = testServerEhlo(t)
+				}
+				defer s.Close()
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(10 * time.Second))
+
+				io.WriteString(c, "MAIL FROM:<a@example.org> SIZE="+tc.size+"\r\n")
+				scanner.Scan()
+				if !strings.HasPrefix(scanner.Text(), tc.want) {
+					t.Fatalf("MAIL SIZE=%s: %q, want %q", tc.size, scanner.Text(), tc.want)
+				}
+			})
+		}
+	}
+}
+
+// BDAT's chunk size has no such bound (RFC 3030 section 2:
+// "chunk-size ::= 1*DIGIT"): leading zeros beyond 20 digits are still the
+// chunk's length.
+func TestServer_BDATChunkSizeLongerThan20Digits(t *testing.T) {
+	_, s, c, scanner := testBDATTransaction(t, 0)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "BDAT 0000000000000000000008 LAST\r\nHey <3\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+}
+
 func TestServer_BDATChunkBeyond32Bits(t *testing.T) {
 	_, s, c, scanner := testBDATTransaction(t, 10)
 	defer s.Close()
