@@ -370,3 +370,20 @@ func TestParseArgsEmptyValue(t *testing.T) {
 		}
 	}
 }
+
+// A keyword given twice, in any case, is refused: the server cannot tell which
+// value the client meant. RFC 6152 section 3: "Only one BODY parameter may be
+// used in a single MAIL command."
+func TestParseArgsRepeatedKeyword(t *testing.T) {
+	for _, raw := range []string{
+		" BODY=7BIT BODY=8BITMIME",
+		" SIZE=10 size=10",
+		" SMTPUTF8 BODY=8BITMIME smtputf8",
+		" FOO=1 BAR=2 foo=3",
+		" SIZE=10\tSIZE=20",
+	} {
+		if got, err := parseArgs(raw); err == nil {
+			t.Errorf("parseArgs(%q) = %v, want an error", raw, got)
+		}
+	}
+}
