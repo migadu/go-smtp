@@ -791,7 +791,9 @@ func (c *Conn) handleMail(arg string) {
 			opts.EnvelopeID = value
 		case "AUTH":
 			// The parameter of the AUTH extension (RFC 4954 section 5).
-			if !c.authOffered() {
+			// Successful AUTH negotiated this extension for the current connection;
+			// a backend may hide further mechanisms once it is authenticated.
+			if !c.didAuth && !c.authOffered() {
 				c.writeResponse(555, EnhancedCode{5, 5, 4}, "AUTH is not implemented")
 				return
 			}
