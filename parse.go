@@ -64,9 +64,11 @@ func cutPrefixFold(s, prefix string) (string, bool) {
 
 // parseSize parses the size declared by the SIZE parameter of MAIL
 // (RFC 1870 section 3: "size-value ::= 1*20DIGIT") or by BDAT (RFC 3030
-// section 2: "chunk-size ::= 1*DIGIT"). Neither grammar is bounded by the
-// integer types, so a size too large for an int64 is valid syntax: tooLarge
-// reports it, and it exceeds any limit the server can have.
+// section 2: "chunk-size ::= 1*DIGIT"). It takes any number of digits, as
+// chunk-size does: the caller checks the 20-digit bound of size-value.
+// Neither grammar is bounded by the integer types, so a size too large for
+// an int64 is valid syntax: tooLarge reports it, and it exceeds any limit
+// the server can have.
 func parseSize(s string) (size int64, tooLarge bool, err error) {
 	// ParseUint, unlike ParseInt, refuses a sign; a bit size of 63 keeps
 	// the result within an int64.

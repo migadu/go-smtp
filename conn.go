@@ -716,6 +716,14 @@ func (c *Conn) handleMail(arg string) {
 		key, value := arg.key, arg.value
 		switch key {
 		case "SIZE":
+			// RFC 1870 section 3 (4): "size-value ::= 1*20DIGIT". A longer
+			// value is a syntax error even when leading zeros leave a small
+			// number; parseSize, which also reads BDAT's unbounded chunk
+			// size, does not check the bound.
+			if len(value) > 20 {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "SIZE value longer than 20 digits")
+				return
+			}
 			size, tooLarge, err := parseSize(value)
 			if err != nil {
 				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse SIZE as an integer")
