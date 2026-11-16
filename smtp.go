@@ -67,8 +67,9 @@ type MailOptions struct {
 	// form with angle brackets stripped.
 	//
 	// nil value indicates missing AUTH, non-nil empty string indicates
-	// AUTH=<>. The parameter is refused with 555 on a connection where
-	// EHLO does not offer AUTH.
+	// AUTH=<>. The parameter is refused with 555 unless EHLO offers AUTH
+	// or AUTH has already succeeded on this connection. A session may stop
+	// offering further authentication mechanisms after successful AUTH.
 	//
 	// Defined in RFC 4954.
 	Auth *string
