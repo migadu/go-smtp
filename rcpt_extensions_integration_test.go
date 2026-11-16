@@ -344,7 +344,8 @@ func TestServer_BackwardCompatibilityRcpt(t *testing.T) {
 	readLine(client)
 }
 
-// Test that unknown RCPT parameters return error 500 when extensions are disabled
+// Test that unknown RCPT parameters return error 555 when extensions are disabled
+// (RFC 5321 section 4.1.1.11)
 func TestServer_RcptExtensionsDisabled(t *testing.T) {
 	backend := &TestBackendWithExtensions{}
 	server := NewServer(backend)
@@ -376,20 +377,20 @@ func TestServer_RcptExtensionsDisabled(t *testing.T) {
 	clientConn.Write([]byte("MAIL FROM:<sender@example.com>\r\n"))
 	readLine(client)
 
-	// Test that unknown RCPT parameter returns error 500
+	// Test that unknown RCPT parameter returns error 555
 	clientConn.Write([]byte("RCPT TO:<user@example.com> UNKNOWNPARAM=value\r\n"))
 	response, _ := readLine(client)
-	if !strings.HasPrefix(response, "500") {
-		t.Fatalf("Expected 500 error for unknown parameter when extensions disabled, got: %s", response)
+	if !strings.HasPrefix(response, "555 5.5.4 ") {
+		t.Fatalf("Expected 555 error for unknown parameter when extensions disabled, got: %s", response)
 	}
 
-	// Test that XRCPTFORWARD also returns error 500 when extensions disabled
+	// Test that XRCPTFORWARD also returns error 555 when extensions disabled
 	xrcptData := base64.StdEncoding.EncodeToString([]byte("user=john\tsession=12345"))
 	rcptCmd := fmt.Sprintf("RCPT TO:<user@example.com> XRCPTFORWARD=%s\r\n", xrcptData)
 	clientConn.Write([]byte(rcptCmd))
 	response, _ = readLine(client)
-	if !strings.HasPrefix(response, "500") {
-		t.Fatalf("Expected 500 error for XRCPTFORWARD when extensions disabled, got: %s", response)
+	if !strings.HasPrefix(response, "555 5.5.4 ") {
+		t.Fatalf("Expected 555 error for XRCPTFORWARD when extensions disabled, got: %s", response)
 	}
 
 	// Cleanup

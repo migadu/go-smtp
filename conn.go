@@ -689,6 +689,12 @@ func (c *Conn) handleMail(arg string) {
 	c.binarymime = false
 	// This is where the Conn may put BODY=8BITMIME, but we already
 	// read the DATA as bytes, so it does not effect our processing.
+	//
+	// A parameter that is not recognized, or belongs to an extension that
+	// is not enabled, gets 555 here and in handleRcpt. RFC 5321 section
+	// 4.1.1.11: "If the server SMTP does not recognize or cannot implement
+	// one or more of the parameters associated with a particular MAIL FROM
+	// or RCPT TO command, it will return code 555."
 	for key, value := range args {
 		switch key {
 		case "SIZE":
@@ -706,13 +712,13 @@ func (c *Conn) handleMail(arg string) {
 			opts.Size = size
 		case "SMTPUTF8":
 			if !c.server.EnableSMTPUTF8 {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
 				return
 			}
 			opts.UTF8 = true
 		case "REQUIRETLS":
 			if !c.server.EnableREQUIRETLS {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "REQUIRETLS is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "REQUIRETLS is not implemented")
 				return
 			}
 			opts.RequireTLS = true
@@ -721,7 +727,7 @@ func (c *Conn) handleMail(arg string) {
 			switch BodyType(value) {
 			case BodyBinaryMIME:
 				if !c.server.EnableBINARYMIME {
-					c.writeResponse(504, EnhancedCode{5, 5, 4}, "BINARYMIME is not implemented")
+					c.writeResponse(555, EnhancedCode{5, 5, 4}, "BINARYMIME is not implemented")
 					return
 				}
 				c.binarymime = true
@@ -734,7 +740,7 @@ func (c *Conn) handleMail(arg string) {
 			opts.Body = BodyType(value)
 		case "RET":
 			if !c.server.EnableDSN {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RET is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "RET is not implemented")
 				return
 			}
 			value = strings.ToUpper(value)
@@ -748,7 +754,7 @@ func (c *Conn) handleMail(arg string) {
 			opts.Return = DSNReturn(value)
 		case "ENVID":
 			if !c.server.EnableDSN {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ENVID is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "ENVID is not implemented")
 				return
 			}
 			value, err := decodeXtext(value)
@@ -776,7 +782,7 @@ func (c *Conn) handleMail(arg string) {
 			opts.Auth = &value
 		case "BY":
 			if !c.server.EnableDELIVERBY {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "DELIVERBY is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "DELIVERBY is not implemented")
 				return
 			}
 			deliverBy := parseDeliverByArgument(value)
@@ -793,7 +799,7 @@ func (c *Conn) handleMail(arg string) {
 			opts.DeliverBy = deliverBy
 		case "MT-PRIORITY":
 			if !c.server.EnableMTPRIORITY {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "MT-PRIORITY is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "MT-PRIORITY is not implemented")
 				return
 			}
 			mtPriority, err := strconv.Atoi(value)
@@ -807,7 +813,7 @@ func (c *Conn) handleMail(arg string) {
 			}
 			opts.MTPriority = &mtPriority
 		default:
-			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
+			c.writeResponse(555, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
 			return
 		}
 	}
@@ -1097,7 +1103,7 @@ func (c *Conn) handleRcpt(arg string) {
 		switch key {
 		case "NOTIFY":
 			if !c.server.EnableDSN {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "NOTIFY is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "NOTIFY is not implemented")
 				return
 			}
 			notify := []DSNNotify{}
@@ -1111,7 +1117,7 @@ func (c *Conn) handleRcpt(arg string) {
 			opts.Notify = notify
 		case "ORCPT":
 			if !c.server.EnableDSN {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ORCPT is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "ORCPT is not implemented")
 				return
 			}
 			aType, aAddr, err := decodeTypedAddress(value)
@@ -1123,7 +1129,7 @@ func (c *Conn) handleRcpt(arg string) {
 			opts.OriginalRecipient = aAddr
 		case "RRVS":
 			if !c.server.EnableRRVS {
-				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RRVS is not implemented")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "RRVS is not implemented")
 				return
 			}
 			value, _, _ = strings.Cut(value, ";") // discard the no-support action
@@ -1136,7 +1142,7 @@ func (c *Conn) handleRcpt(arg string) {
 		default:
 			// Handle custom extensions (non-standard parameters)
 			if !c.server.EnableRCPTExtensions {
-				c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown RCPT parameter")
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "Unknown RCPT parameter")
 				return
 			}
 
