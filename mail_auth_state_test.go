@@ -38,7 +38,10 @@ func TestMailAUTHParameterAfterSuccessfulAuthentication(t *testing.T) {
 			name = "LMTP"
 		}
 		t.Run(name, func(t *testing.T) {
-			configure := func(s *smtp.Server) { s.Backend = mailAuthAfterSuccessBackend{s.Backend.(*backend)} }
+			configure := func(s *smtp.Server) {
+				s.LMTP = lmtp
+				s.Backend = mailAuthAfterSuccessBackend{s.Backend.(*backend)}
+			}
 			var srv *smtp.Server
 			var c net.Conn
 			var scanner *bufio.Scanner
