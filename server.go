@@ -140,7 +140,10 @@ type Server struct {
 	MtPriorityProfile PriorityProfile
 
 	// Allow custom RCPT TO parameters (extensions like XRCPTFORWARD).
-	// When disabled, unknown RCPT parameters will return error 500 like before.
+	// When disabled, unknown RCPT parameters are refused with 555 (RFC 5321
+	// section 4.1.1.11). When enabled, they are passed to Session.Rcpt in
+	// RcptOptions.Extensions, and the session must refuse those it does not
+	// implement with 555 itself.
 	// Should only be used if backend supports custom extensions.
 	EnableRCPTExtensions bool
 

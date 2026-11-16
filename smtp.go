@@ -133,6 +133,7 @@ type RcptOptions struct {
 
 	// Extensions contains custom RCPT parameters not defined in standard SMTP.
 	// This includes extensions like XRCPTFORWARD and other server-specific parameters.
-	// The map is nil if no custom parameters are present.
+	// The keys are upper-case. The map is nil if no custom parameters are
+	// present.
 	Extensions map[string]string
 }
