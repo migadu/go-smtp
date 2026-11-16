@@ -126,11 +126,14 @@ func parseArgs(s string) (map[string]string, error) {
 		// contain '=' (e.g. AUTH=dXNlcg== with base64 padding, RFC 4954,
 		// or an ORCPT address).
 		key, value, found := strings.Cut(arg, "=")
-		if found {
-			argMap[toUpperASCII(key)] = value
-		} else {
-			argMap[toUpperASCII(key)] = ""
+		// "esmtp-value = 1*(%d33-60 / %d62-126)" (RFC 5321 section
+		// 4.1.2): "=" with nothing after it is malformed. Refusing it
+		// leaves an empty value meaning no "=" at all, which is what a
+		// parameter that takes no value (SMTPUTF8, REQUIRETLS) requires.
+		if found && value == "" {
+			return nil, fmt.Errorf("missing value after %q", arg)
 		}
+		argMap[toUpperASCII(key)] = value
 	}
 	return argMap, nil
 }

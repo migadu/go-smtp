@@ -359,3 +359,14 @@ func TestESMTPParametersRequireBracketedPath(t *testing.T) {
 		}
 	}
 }
+
+// An esmtp-value has at least one character (RFC 5321 section 4.1.2:
+// "esmtp-value = 1*(%d33-60 / %d62-126)"), so "=" with nothing after it is
+// malformed, not a parameter with an empty value.
+func TestParseArgsEmptyValue(t *testing.T) {
+	for _, raw := range []string{" SMTPUTF8=", " FOO=", " SIZE=10 BODY="} {
+		if got, err := parseArgs(raw); err == nil {
+			t.Errorf("parseArgs(%q) = %v, want an error", raw, got)
+		}
+	}
+}
