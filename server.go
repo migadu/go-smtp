@@ -105,7 +105,8 @@ type Server struct {
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool
 
-	// Advertise REQUIRETLS (RFC 8689) capability.
+	// Advertise REQUIRETLS (RFC 8689) capability. It is advertised, and
+	// its MAIL parameter taken, only over TLS.
 	// Should be used only if backend supports it.
 	EnableREQUIRETLS bool
 

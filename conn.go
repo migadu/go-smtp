@@ -393,6 +393,20 @@ func (c *Conn) authAllowed() bool {
 	return isTLS || c.server.AllowInsecureAuth
 }
 
+// authOffered reports whether EHLO offers AUTH on this connection: AUTH is
+// allowed and the session has at least one mechanism.
+func (c *Conn) authOffered() bool {
+	return c.authAllowed() && len(c.authMechanisms()) > 0
+}
+
+// requireTLSOffered reports whether EHLO offers REQUIRETLS on this
+// connection. RFC 8689 section 2 has the option specified only when "The
+// session itself MUST employ TLS transmission."
+func (c *Conn) requireTLSOffered() bool {
+	_, isTLS := c.TLSConnectionState()
+	return isTLS && c.server.EnableREQUIRETLS
+}
+
 // protocolError writes errors responses and closes the connection once too many
 // have occurred.
 func (c *Conn) protocolError(code int, ec EnhancedCode, msg string) {
@@ -544,27 +558,19 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if _, isTLS := c.TLSConnectionState(); c.server.TLSConfig != nil && !isTLS {
 		caps = append(caps, "STARTTLS")
 	}
-	if c.authAllowed() {
-		mechs := c.authMechanisms()
-
-		authCap := "AUTH"
-		for _, name := range mechs {
-			authCap += " " + name
-		}
-
-		if len(mechs) > 0 {
-			caps = append(caps, authCap)
-			if c.server.EnableLegacyAuthCap {
-				// Obsolete "AUTH=" form for Microsoft clients; see
-				// Server.EnableLegacyAuthCap.
-				caps = append(caps, "AUTH="+strings.Join(mechs, " "))
-			}
+	if c.authOffered() {
+		mechs := strings.Join(c.authMechanisms(), " ")
+		caps = append(caps, "AUTH "+mechs)
+		if c.server.EnableLegacyAuthCap {
+			// Obsolete "AUTH=" form for Microsoft clients; see
+			// Server.EnableLegacyAuthCap.
+			caps = append(caps, "AUTH="+mechs)
 		}
 	}
 	if c.server.EnableSMTPUTF8 {
 		caps = append(caps, "SMTPUTF8")
 	}
-	if _, isTLS := c.TLSConnectionState(); isTLS && c.server.EnableREQUIRETLS {
+	if c.requireTLSOffered() {
 		caps = append(caps, "REQUIRETLS")
 	}
 	if c.server.EnableBINARYMIME {
@@ -691,10 +697,15 @@ func (c *Conn) handleMail(arg string) {
 	// read the DATA as bytes, so it does not effect our processing.
 	//
 	// A parameter that is not recognized, or belongs to an extension that
-	// is not enabled, gets 555 here and in handleRcpt. RFC 5321 section
-	// 4.1.1.11: "If the server SMTP does not recognize or cannot implement
-	// one or more of the parameters associated with a particular MAIL FROM
-	// or RCPT TO command, it will return code 555."
+	// is not offered on this connection, gets 555 here and in handleRcpt.
+	// RFC 5321 section 4.1.1.11: "If the server SMTP does not recognize or
+	// cannot implement one or more of the parameters associated with a
+	// particular MAIL FROM or RCPT TO command, it will return code 555."
+	//
+	// SMTPUTF8 and REQUIRETLS take no value. RFC 6531 section 3.4: "If
+	// this parameter is provided, it MUST not accept a value." RFC 8689
+	// section 2: "No value is associated with this parameter." A valued
+	// one is a syntax error, 501.
 	for key, value := range args {
 		switch key {
 		case "SIZE":
@@ -715,10 +726,18 @@ func (c *Conn) handleMail(arg string) {
 				c.writeResponse(555, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
 				return
 			}
+			if value != "" {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "SMTPUTF8 does not take a value")
+				return
+			}
 			opts.UTF8 = true
 		case "REQUIRETLS":
-			if !c.server.EnableREQUIRETLS {
+			if !c.requireTLSOffered() {
 				c.writeResponse(555, EnhancedCode{5, 5, 4}, "REQUIRETLS is not implemented")
+				return
+			}
+			if value != "" {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "REQUIRETLS does not take a value")
 				return
 			}
 			opts.RequireTLS = true
@@ -764,6 +783,11 @@ func (c *Conn) handleMail(arg string) {
 			}
 			opts.EnvelopeID = value
 		case "AUTH":
+			// The parameter of the AUTH extension (RFC 4954 section 5).
+			if !c.authOffered() {
+				c.writeResponse(555, EnhancedCode{5, 5, 4}, "AUTH is not implemented")
+				return
+			}
 			value, err := decodeXtext(value)
 			if err != nil || value == "" {
 				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
