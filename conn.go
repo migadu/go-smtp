@@ -1174,7 +1174,7 @@ func (c *Conn) handleRcpt(arg string) {
 			opts.RequireRecipientValidSince = rrvsTime
 		default:
 			// Handle custom extensions (non-standard parameters)
-			if !c.server.EnableRCPTExtensions {
+			if !c.server.EnableRCPTExtensions || !c.server.takesRCPTExtension(key) {
 				c.writeResponse(555, EnhancedCode{5, 5, 4}, "Unknown RCPT parameter")
 				return
 			}

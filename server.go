@@ -144,9 +144,17 @@ type Server struct {
 	// When disabled, unknown RCPT parameters are refused with 555 (RFC 5321
 	// section 4.1.1.11). When enabled, they are passed to Session.Rcpt in
 	// RcptOptions.Extensions, and the session must refuse those it does not
-	// implement with 555 itself.
+	// implement with 555 itself, unless RCPTExtensions names them.
 	// Should only be used if backend supports custom extensions.
 	EnableRCPTExtensions bool
+	// The custom RCPT TO parameters taken when EnableRCPTExtensions is set,
+	// by keyword (compared case-insensitively). When not nil, any other
+	// custom parameter is refused with 555 where it stands, as when
+	// EnableRCPTExtensions is off, so that the first parameter refused
+	// decides the reply even when another one after it is malformed. A
+	// session's own refusal comes only after every parameter was read. When
+	// nil, every custom parameter is passed to the session.
+	RCPTExtensions []string
 
 	// Advertise XCLIENT (Postfix extension) capability.
 	// Should only be used if backend supports it and proper trusted networks are configured.
@@ -186,6 +194,20 @@ func (s *Server) maxMessageBytes() int64 {
 		return s.MaxMessageBytesFunc()
 	}
 	return s.MaxMessageBytes
+}
+
+// takesRCPTExtension reports whether the custom RCPT parameter keyword is
+// passed to the session (see RCPTExtensions).
+func (s *Server) takesRCPTExtension(keyword string) bool {
+	if s.RCPTExtensions == nil {
+		return true
+	}
+	for _, k := range s.RCPTExtensions {
+		if equalFoldASCII(k, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // AddXCLIENTTrustedNetwork adds a trusted network for XCLIENT command.
