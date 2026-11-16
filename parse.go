@@ -133,7 +133,18 @@ func parseArgs(s string) (map[string]string, error) {
 		if found && value == "" {
 			return nil, fmt.Errorf("missing value after %q", arg)
 		}
-		argMap[toUpperASCII(key)] = value
+		// A keyword given twice is ambiguous: which value the client meant
+		// cannot be told, and the map would keep only the last one. RFC 6152
+		// section 3: "Only one BODY parameter may be used in a single MAIL
+		// command." RFC 1870 section 6 says the same of SIZE, and RFC 3461
+		// section 4.5 of RET, ENVID, NOTIFY and ORCPT, for which "the ESMTP
+		// server SHOULD respond with "501 syntax error in parameters or
+		// arguments"". Refused whatever the keyword.
+		key = toUpperASCII(key)
+		if _, ok := argMap[key]; ok {
+			return nil, fmt.Errorf("parameter %q given more than once", key)
+		}
+		argMap[key] = value
 	}
 	return argMap, nil
 }
