@@ -99,6 +99,9 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 	if s.backend.authDisabled {
 		return nil, smtp.ErrAuthUnsupported
 	}
+	if mech != sasl.Plain {
+		return nil, smtp.ErrAuthUnknownMechanism
+	}
 	return sasl.NewPlainServer(func(identity, username, password string) error {
 		if identity != "" && identity != username {
 			return errors.New("Invalid identity")
