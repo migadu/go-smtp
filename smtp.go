@@ -136,6 +136,7 @@ type RcptOptions struct {
 	// This includes extensions like XRCPTFORWARD and other server-specific parameters.
 	// The keys are upper-case. The map is nil if no custom parameters are
 	// present. A parameter given twice refuses the command with 501, so
-	// each value is the only one the client sent.
+	// each value is the only one the client sent. When Server.RCPTExtensions
+	// is set, only the parameters it names are here.
 	Extensions map[string]string
 }

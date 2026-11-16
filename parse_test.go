@@ -313,16 +313,21 @@ func TestParseCmd(t *testing.T) {
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
 		raw  string
-		want map[string]string
+		want []esmtpParam
 	}{
-		{" BODY=8BITMIME SIZE=1024 SMTPUTF8", map[string]string{
-			"BODY": "8BITMIME", "SIZE": "1024", "SMTPUTF8": "",
+		{"", nil},
+		// In the order given, keywords upper-cased.
+		{" BODY=8BITMIME SIZE=1024 SMTPUTF8", []esmtpParam{
+			{"BODY", "8BITMIME"}, {"SIZE", "1024"}, {"SMTPUTF8", ""},
+		}},
+		{" smtputf8 size=1024 Body=8bitmime", []esmtpParam{
+			{"SMTPUTF8", ""}, {"SIZE", "1024"}, {"BODY", "8bitmime"},
 		}},
 		// Values may contain '=', e.g. base64 padding in AUTH (RFC 4954)
 		// or xtext-free ORCPT values; only the first '=' separates the key.
-		{" AUTH=dXNlcg==", map[string]string{"AUTH": "dXNlcg=="}},
-		{" ORCPT=rfc822;user=x@example.org", map[string]string{
-			"ORCPT": "rfc822;user=x@example.org",
+		{" AUTH=dXNlcg==", []esmtpParam{{"AUTH", "dXNlcg=="}}},
+		{" ORCPT=rfc822;user=x@example.org", []esmtpParam{
+			{"ORCPT", "rfc822;user=x@example.org"},
 		}},
 	}
 	for _, tc := range tests {
@@ -335,9 +340,9 @@ func TestParseArgs(t *testing.T) {
 			t.Errorf("parseArgs(%q) = %v, want %v", tc.raw, got, tc.want)
 			continue
 		}
-		for k, v := range tc.want {
-			if got[k] != v {
-				t.Errorf("parseArgs(%q)[%q] = %q, want %q", tc.raw, k, got[k], v)
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Errorf("parseArgs(%q)[%d] = %v, want %v", tc.raw, i, got[i], tc.want[i])
 			}
 		}
 	}

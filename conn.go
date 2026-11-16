@@ -706,7 +706,14 @@ func (c *Conn) handleMail(arg string) {
 	// this parameter is provided, it MUST not accept a value." RFC 8689
 	// section 2: "No value is associated with this parameter." A valued
 	// one is a syntax error, 501.
-	for key, value := range args {
+	//
+	// The parameters are taken in the order the client sent them, and the
+	// first one refused decides the reply, here and in handleRcpt: neither
+	// RFC 5321 section 4.1.1.11 nor section 4.2.2 ranks 555 against 501
+	// when one parameter is not recognized and another is malformed, but
+	// the same command must get the same reply every time.
+	for _, arg := range args {
+		key, value := arg.key, arg.value
 		switch key {
 		case "SIZE":
 			size, tooLarge, err := parseSize(value)
@@ -1123,7 +1130,9 @@ func (c *Conn) handleRcpt(arg string) {
 
 	opts := &RcptOptions{}
 
-	for key, value := range args {
+	// In the order the client sent them, as in handleMail.
+	for _, arg := range args {
+		key, value := arg.key, arg.value
 		switch key {
 		case "NOTIFY":
 			if !c.server.EnableDSN {
@@ -1165,7 +1174,7 @@ func (c *Conn) handleRcpt(arg string) {
 			opts.RequireRecipientValidSince = rrvsTime
 		default:
 			// Handle custom extensions (non-standard parameters)
-			if !c.server.EnableRCPTExtensions {
+			if !c.server.EnableRCPTExtensions || !c.server.takesRCPTExtension(key) {
 				c.writeResponse(555, EnhancedCode{5, 5, 4}, "Unknown RCPT parameter")
 				return
 			}

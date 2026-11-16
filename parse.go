@@ -112,15 +112,23 @@ func parseCmd(line string) (cmd string, arg string, err error) {
 	return command, arguments, nil
 }
 
-// Takes the arguments proceeding a command and files them
-// into a map[string]string after uppercasing each key.  Sample arg
-// string:
+// esmtpParam is one parameter of MAIL or RCPT, "esmtp-param = esmtp-keyword
+// ["=" esmtp-value]" (RFC 5321 section 4.1.2), with its keyword upper-cased.
+type esmtpParam struct {
+	key, value string
+}
+
+// Takes the arguments proceeding a command and returns them in the order
+// they were given, after uppercasing each key. The order lets the first
+// parameter refused decide the reply when more than one is wrong, so the
+// same command always gets the same reply. Sample arg string:
 //
 //	" BODY=8BITMIME SIZE=1024 SMTPUTF8"
 //
 // The leading space is mandatory.
-func parseArgs(s string) (map[string]string, error) {
-	argMap := map[string]string{}
+func parseArgs(s string) ([]esmtpParam, error) {
+	var params []esmtpParam
+	seen := map[string]struct{}{}
 	for _, arg := range strings.Fields(s) {
 		// Split on the first '=' only: parameter values may themselves
 		// contain '=' (e.g. AUTH=dXNlcg== with base64 padding, RFC 4954,
@@ -134,19 +142,20 @@ func parseArgs(s string) (map[string]string, error) {
 			return nil, fmt.Errorf("missing value after %q", arg)
 		}
 		// A keyword given twice is ambiguous: which value the client meant
-		// cannot be told, and the map would keep only the last one. RFC 6152
-		// section 3: "Only one BODY parameter may be used in a single MAIL
-		// command." RFC 1870 section 6 says the same of SIZE, and RFC 3461
-		// section 4.5 of RET, ENVID, NOTIFY and ORCPT, for which "the ESMTP
-		// server SHOULD respond with "501 syntax error in parameters or
-		// arguments"". Refused whatever the keyword.
+		// cannot be told. RFC 6152 section 3: "Only one BODY parameter may
+		// be used in a single MAIL command." RFC 1870 section 6 says the
+		// same of SIZE, and RFC 3461 section 4.5 of RET, ENVID, NOTIFY and
+		// ORCPT, for which "the ESMTP server SHOULD respond with "501
+		// syntax error in parameters or arguments"". Refused whatever the
+		// keyword, before any parameter is looked at.
 		key = toUpperASCII(key)
-		if _, ok := argMap[key]; ok {
+		if _, ok := seen[key]; ok {
 			return nil, fmt.Errorf("parameter %q given more than once", key)
 		}
-		argMap[key] = value
+		seen[key] = struct{}{}
+		params = append(params, esmtpParam{key, value})
 	}
-	return argMap, nil
+	return params, nil
 }
 
 func parseHelloArgument(arg string) (string, error) {
