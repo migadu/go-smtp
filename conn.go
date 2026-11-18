@@ -2183,6 +2183,15 @@ func (c *Conn) handleXCLIENT(arg string) {
 		return
 	}
 
+	// Call backend XCLIENT handler if implemented. A refused command records
+	// nothing: XCLIENTData keeps returning what was accepted before it.
+	if xclientBackend, ok := c.Session().(XCLIENTBackend); ok {
+		if err := xclientBackend.XCLIENT(c.Session(), attrs); err != nil {
+			c.writeError(451, EnhancedCode{4, 0, 0}, err)
+			return
+		}
+	}
+
 	// Initialize xclientData if not already done
 	if c.xclientData == nil {
 		c.xclientData = make(map[string]string)
@@ -2191,14 +2200,6 @@ func (c *Conn) handleXCLIENT(arg string) {
 	// Store attributes
 	for name, value := range attrs {
 		c.xclientData[name] = value
-	}
-
-	// Call backend XCLIENT handler if implemented
-	if xclientBackend, ok := c.Session().(XCLIENTBackend); ok {
-		if err := xclientBackend.XCLIENT(c.Session(), attrs); err != nil {
-			c.writeError(451, EnhancedCode{4, 0, 0}, err)
-			return
-		}
 	}
 
 	// Per XCLIENT spec, we must reset the session state and issue a new

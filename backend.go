@@ -166,6 +166,9 @@ type XCLIENTBackend interface {
 	// XCLIENT handles the XCLIENT command. The attrs parameter contains
 	// the connection attributes provided by the client (ADDR, PORT, PROTO,
 	// HELO, LOGIN, NAME). Backends can validate and process these attributes.
-	// If an error is returned, the XCLIENT command will be rejected.
+	// If an error is returned, the XCLIENT command will be rejected and attrs
+	// are not recorded: Conn.XCLIENTData keeps returning the attributes of the
+	// XCLIENT commands accepted before. During the call, Conn.XCLIENTData does
+	// not include attrs yet.
 	XCLIENT(session Session, attrs map[string]string) error
 }
