@@ -82,7 +82,8 @@ type Conn struct {
 	recipients   []string
 	didAuth      bool
 
-	// XCLIENT data - stores connection information provided by XCLIENT command
+	// XCLIENT data - stores connection information provided by XCLIENT command.
+	// Guarded by locker: XCLIENTData may be called from any goroutine.
 	xclientData map[string]string
 }
 
@@ -1449,7 +1450,10 @@ func (c *Conn) handleStartTLS() {
 	c.didAuth = false
 	// RFC 3207 section 4.2: the server MUST discard any knowledge obtained from
 	// the client which was not obtained from the TLS negotiation itself.
+	// XCLIENTData reads xclientData under c.locker, from any goroutine.
+	c.locker.Lock()
 	c.xclientData = nil
+	c.locker.Unlock()
 	c.reset()
 }
 
@@ -2192,15 +2196,16 @@ func (c *Conn) handleXCLIENT(arg string) {
 		}
 	}
 
-	// Initialize xclientData if not already done
+	// Store attributes under c.locker: XCLIENTData reads them under it, and a
+	// backend may call it from another goroutine while this command runs.
+	c.locker.Lock()
 	if c.xclientData == nil {
 		c.xclientData = make(map[string]string)
 	}
-
-	// Store attributes
 	for name, value := range attrs {
 		c.xclientData[name] = value
 	}
+	c.locker.Unlock()
 
 	// Per XCLIENT spec, we must reset the session state and issue a new
 	// greeting. This is similar to what we do for STARTTLS.
