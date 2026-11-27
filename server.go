@@ -39,18 +39,18 @@ type Server struct {
 	AllowInsecureAuth bool
 	Debug             io.Writer
 	ErrorLog          Logger
-	// ReadTimeout bounds each wait for client input: for the next command
-	// line, and for more message content during DATA and BDAT. It does not
-	// bound a whole transfer (see DataTimeout).
+	// ReadTimeout bounds each wait for the next command line. It also bounds
+	// each wait for more message content when DataReadTimeout is zero.
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	// DataTimeout, if non-zero, bounds the time a client may take to send
-	// message content: a DATA body, counted from the 354 reply, or a BDAT
-	// chunk, counted from its command line. ReadTimeout still bounds each
-	// wait within it. A client that keeps sending is therefore not cut off
-	// after ReadTimeout, while one that trickles content cannot make a
-	// transfer last longer than this.
+	// DataReadTimeout bounds each wait for more message content during DATA
+	// and BDAT. A zero value uses ReadTimeout.
+	DataReadTimeout time.Duration
+
+	// DataTimeout, if non-zero, bounds the time a client may take to send a
+	// DATA body from the 354 reply or a BDAT chunk from its command line.
+	// The content read timeout still bounds each wait within that time.
 	DataTimeout time.Duration
 
 	// MaxMessageBytesFunc, if set, is called for the message size limit
