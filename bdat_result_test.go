@@ -33,17 +33,17 @@ func (s *delayedBDATResultSession) Data(_ context.Context, r io.Reader) error {
 		close(s.firstRead)
 		<-s.firstReturn
 		if s.panicFirst {
-			panic("aborted transfer returned late")
+			panic("aborted transfer panicked")
 		}
-		return errors.New("aborted transfer returned late: " + err.Error())
+		return errors.New("aborted transfer: " + err.Error())
 	}
 	close(s.secondRead)
 	<-s.secondReturn
 	return err
 }
 
-// Reset may finish before an aborted backend call returns. Its result must not
-// be sent to a later transfer's result channel, including a recovered panic.
+// Reset must wait for an aborted backend call to return. Its result, including
+// a recovered panic, belongs to that transfer alone.
 func TestServer_BDATAbortedResultDoesNotReachNextTransaction(t *testing.T) {
 	for _, lmtp := range []bool{false, true} {
 		for _, panicFirst := range []bool{false, true} {
@@ -101,20 +101,33 @@ func TestServer_BDATAbortedResultDoesNotReachNextTransaction(t *testing.T) {
 						t.Fatal("backend did not reach the expected transfer state")
 					}
 				}
+				readAsync := func() <-chan string {
+					replies := make(chan string, 1)
+					go func() {
+						line, _ := r.ReadString('\n')
+						replies <- line
+					}()
+					return replies
+				}
 				envelope()
 				command("BDAT 1\r\na", "250 ")
-				command("RSET\r\n", "250 ")
+				io.WriteString(conn, "RSET\r\n")
 				wait(sess.firstRead)
+				resetReply := readAsync()
+				select {
+				case line := <-resetReply:
+					t.Fatalf("RSET answered before its backend Data returned: %q", line)
+				case <-time.After(100 * time.Millisecond):
+				}
+				first.Do(func() { close(sess.firstReturn) })
+				wait(sess.firstReturned)
+				if line := <-resetReply; !strings.HasPrefix(line, "250 ") {
+					t.Fatalf("RSET: %q, want 250", line)
+				}
 				envelope()
 				io.WriteString(conn, "BDAT 1 LAST\r\nb")
 				wait(sess.secondRead)
-				first.Do(func() { close(sess.firstReturn) })
-				wait(sess.firstReturned)
-				replies := make(chan string, 1)
-				go func() {
-					line, _ := r.ReadString('\n')
-					replies <- line
-				}()
+				replies := readAsync()
 				select {
 				case line := <-replies:
 					t.Fatalf("second transfer answered before its backend returned: %q", line)

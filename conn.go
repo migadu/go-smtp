@@ -69,11 +69,15 @@ type Conn struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 
+	// BDAT worker state shared by the serve loop and Close, guarded by locker.
 	bdatPipe      *io.PipeWriter
-	bdatCtxCancel context.CancelFunc // cancels the in-flight BDAT command context on abort
-	bdatStatus    *statusCollector   // used for BDAT on LMTP
+	bdatCtxCancel context.CancelFunc
+	bdatDone      chan struct{} // set while the worker is running
+	bdatLogout    Session       // detached by Close for the worker to log out
 	dataResult    chan error
-	bytesReceived int64 // counts total size of chunks when BDAT is used
+
+	bdatStatus    *statusCollector // used for BDAT on LMTP
+	bytesReceived int64            // counts total size of chunks when BDAT is used
 	// A BDAT chunk was refused, but the transaction was left open for the
 	// BDAT LAST that gets no reply in LMTP; see handleBdat.
 	bdatFailed bool
@@ -324,17 +328,16 @@ func (c *Conn) Close() error {
 	// ...) from within Logout, which would deadlock otherwise.
 	c.locker.Lock()
 	c.closed = true
-	if c.bdatPipe != nil {
-		c.bdatPipe.CloseWithError(ErrDataReset)
-		c.bdatPipe = nil
-	}
-	if c.bdatCtxCancel != nil {
-		c.bdatCtxCancel()
-		c.bdatCtxCancel = nil
-	}
+	c.abortBdatLocked()
 	// Take the session as takeSession does, inside this lock section.
 	session := c.session
 	c.session = nil
+	if session != nil && c.bdatDone != nil {
+		// Close can run inside Data itself. Let the worker finish before
+		// logging out, while closing the transport here.
+		c.bdatLogout = session
+		session = nil
+	}
 	conn := c.conn
 	c.locker.Unlock()
 
@@ -478,10 +481,7 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	// While a BDAT transfer is open, leave its session and metadata alone.
 	// Refuse without touching the transfer; the client can finish it or issue
 	// RSET before greeting again.
-	c.locker.Lock()
-	transferring := c.bdatPipe != nil
-	c.locker.Unlock()
-	if transferring {
+	if c.hasBdatTransfer() {
 		c.writeResponse(550, EnhancedCode{5, 5, 1}, "Finish or reset the chunked transfer before greeting again")
 		return
 	}
@@ -661,7 +661,7 @@ func (c *Conn) handleMail(arg string) {
 	}
 	// A BDAT transfer belongs to an open transaction: a bad sequence, like
 	// the nested MAIL below.
-	if c.bdatPipe != nil {
+	if c.hasBdatTransfer() {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "MAIL not allowed during message transfer")
 		return
 	}
@@ -1103,7 +1103,7 @@ func (c *Conn) handleRcpt(arg string) {
 	}
 	// RFC 3030 section 2 sends BDAT "After all MAIL and RCPT responses are
 	// collected and processed": a RCPT after it is out of sequence.
-	if c.bdatPipe != nil {
+	if c.hasBdatTransfer() {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "RCPT not allowed during message transfer")
 		return
 	}
@@ -1430,6 +1430,8 @@ func (c *Conn) handleStartTLS() {
 		return
 	}
 
+	c.stopBdat()
+
 	// Guard the connection swap with c.locker: Conn.Close() reads c.conn under
 	// the same lock and can run on a different goroutine during
 	// Server.Close/Shutdown. Without this, the unsynchronized write to c.conn
@@ -1465,7 +1467,7 @@ func (c *Conn) handleData(arg string) {
 	}
 	// RFC 3030 sections 2 and 3: DATA after a BDAT of the current
 	// transaction, or after MAIL BODY=BINARYMIME, MUST get 503.
-	if c.bdatPipe != nil {
+	if c.hasBdatTransfer() {
 		c.writeResponse(503, EnhancedCode{5, 5, 1}, "DATA not allowed during message transfer")
 		return
 	}
@@ -1612,65 +1614,14 @@ func (c *Conn) handleBdat(arg string) {
 		c.bdatStatus = c.createStatusCollector()
 	}
 
-	if c.bdatPipe == nil {
-		var r *io.PipeReader
-		r, c.bdatPipe = io.Pipe()
-
-		dataResult := make(chan error, 1)
-		c.dataResult = dataResult
-
-		// The data goroutine runs concurrently with the serve loop, which can
-		// abort the transfer (RSET, Close) and clear connection state under
-		// c.locker; give the goroutine stable copies instead of Conn fields.
-		// Its result channel also belongs to this transfer: an aborted backend
-		// call may return after the next transaction replaces c.dataResult.
-		recipients := append([]string(nil), c.recipients...)
-		bdatStatus := c.bdatStatus
-
-		// Unlike DATA, BDAT returns to the command loop between chunks, so
-		// the transaction can be aborted while the backend call is still in
-		// flight. A backend blocked in upstream I/O never observes the pipe's
-		// ErrDataReset; register the cancel on the Conn so reset() and
-		// Close() can deliver the abort through the context.
-		dataCtx, dataCancel := context.WithCancel(c.Context())
-		c.locker.Lock()
-		c.bdatCtxCancel = dataCancel
-		c.locker.Unlock()
-
-		go func() {
-			defer dataCancel()
-			defer func() {
-				if err := recover(); err != nil {
-					c.handlePanic(err, bdatStatus)
-
-					dataResult <- errPanic
-					r.CloseWithError(errPanic)
-				}
-			}()
-
-			var err error
-			if !c.server.LMTP {
-				err = c.Session().Data(dataCtx, r)
-			} else {
-				lmtpSession, ok := c.Session().(LMTPSession)
-				if !ok {
-					err = c.Session().Data(dataCtx, r)
-					for _, rcpt := range recipients {
-						bdatStatus.SetStatus(rcpt, err)
-					}
-				} else {
-					err = lmtpSession.LMTPData(dataCtx, r, bdatStatus)
-				}
-			}
-
-			dataResult <- err
-			r.CloseWithError(err)
-		}()
+	pipe, result := c.bdatWriter()
+	if pipe == nil {
+		return // Close took the session before this chunk could be started.
 	}
 
 	cr := newContentReader(c)
 	chunk := io.LimitReader(cr, size)
-	_, err = io.Copy(c.bdatPipe, chunk)
+	_, err = io.Copy(pipe, chunk)
 	if err != nil {
 		// Either the chunk could not be read, or the backend returned an error
 		// early using CloseWithError without consuming the whole chunk.
@@ -1699,9 +1650,9 @@ func (c *Conn) handleBdat(arg string) {
 	c.bytesReceived += size
 
 	if last {
-		c.bdatPipe.Close()
+		pipe.Close()
 
-		err := <-c.dataResult
+		err := <-result
 
 		if c.server.LMTP {
 			c.bdatStatus.fillRemaining(err)
@@ -1724,6 +1675,110 @@ func (c *Conn) handleBdat(arg string) {
 	}
 }
 
+func (c *Conn) hasBdatTransfer() bool {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	return c.bdatPipe != nil
+}
+
+// bdatWriter returns the current transfer, starting its worker if needed.
+// Publish the worker and capture its session under the same lock as Close.
+func (c *Conn) bdatWriter() (*io.PipeWriter, <-chan error) {
+	ctx := c.Context()
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.closed {
+		return nil, nil
+	}
+	if c.bdatPipe != nil {
+		return c.bdatPipe, c.dataResult
+	}
+
+	r, pipe := io.Pipe()
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	dataCtx, cancel := context.WithCancel(ctx)
+	c.bdatPipe = pipe
+	c.dataResult = result
+	c.bdatCtxCancel = cancel
+	c.bdatDone = done
+	session := c.session
+	recipients := append([]string(nil), c.recipients...)
+	status := c.bdatStatus
+	go func() {
+		defer c.endBdat(done)
+		defer cancel()
+		defer func() {
+			if err := recover(); err != nil {
+				c.handlePanic(err, status)
+				result <- errPanic
+				r.CloseWithError(errPanic)
+			}
+		}()
+
+		var err error
+		if lmtp, ok := session.(LMTPSession); status != nil && ok {
+			err = lmtp.LMTPData(dataCtx, r, status)
+		} else {
+			err = session.Data(dataCtx, r)
+			if status != nil {
+				for _, rcpt := range recipients {
+					status.SetStatus(rcpt, err)
+				}
+			}
+		}
+		result <- err
+		r.CloseWithError(err)
+	}()
+
+	return pipe, result
+}
+
+// abortBdatLocked interrupts both the pipe reader and any backend I/O using
+// the transfer context. The caller holds locker.
+func (c *Conn) abortBdatLocked() {
+	if c.bdatPipe != nil {
+		c.bdatPipe.CloseWithError(ErrDataReset)
+		c.bdatPipe = nil
+	}
+	c.dataResult = nil
+	if c.bdatCtxCancel != nil {
+		c.bdatCtxCancel()
+		c.bdatCtxCancel = nil
+	}
+}
+
+// stopBdat runs on the serve goroutine before resetting or replacing the
+// session, so its backend callbacks cannot overlap Data or LMTPData.
+func (c *Conn) stopBdat() {
+	c.locker.Lock()
+	c.abortBdatLocked()
+	done := c.bdatDone
+	c.locker.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func (c *Conn) endBdat(done chan struct{}) {
+	defer close(done)
+	c.locker.Lock()
+	c.bdatDone = nil
+	session := c.bdatLogout
+	c.bdatLogout = nil
+	c.locker.Unlock()
+	if session != nil {
+		// A deferred Logout runs on the worker, beyond the server command's
+		// panic handler. The transport is already closing, so only log it.
+		defer func() {
+			if err := recover(); err != nil {
+				c.handlePanic(err, nil)
+			}
+		}()
+		c.logoutSession(session)
+	}
+}
+
 // ErrDataReset is returned by Reader pased to Data function if client does not
 // send another BDAT command and instead closes connection or issues RSET command.
 var ErrDataReset = errors.New("smtp: message transmission aborted")
@@ -1740,7 +1795,7 @@ func (c *Conn) handlePanic(err interface{}, status *statusCollector) {
 	}
 
 	stack := debug.Stack()
-	c.server.ErrorLog.Printf("panic serving %v: %v\n%s", c.conn.RemoteAddr(), err, stack)
+	c.server.ErrorLog.Printf("panic serving %v: %v\n%s", c.Conn().RemoteAddr(), err, stack)
 }
 
 func (c *Conn) createStatusCollector() *statusCollector {
@@ -2351,18 +2406,9 @@ func (c *Conn) reset() {
 // replacement session already has fresh backend state; a reused session instead
 // needs reset() to notify the backend as well.
 func (c *Conn) resetState() Session {
+	c.stopBdat()
 	c.locker.Lock()
 	defer c.locker.Unlock()
-	if c.bdatPipe != nil {
-		c.bdatPipe.CloseWithError(ErrDataReset)
-		c.bdatPipe = nil
-	}
-	if c.bdatCtxCancel != nil {
-		// The pipe error only reaches a backend that is reading the message;
-		// cancelling the command context aborts one blocked in upstream I/O.
-		c.bdatCtxCancel()
-		c.bdatCtxCancel = nil
-	}
 	c.bdatStatus = nil
 	c.bdatFailed = false
 	c.bytesReceived = 0

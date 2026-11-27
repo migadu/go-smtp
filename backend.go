@@ -76,6 +76,9 @@ func (f BackendFunc) NewSession(c *Conn) (Session, error) {
 // not cancel the context while a backend call is still in flight. Backends
 // should propagate the context into their I/O (database queries, upstream
 // deliveries) and may layer their own deadlines on top of it.
+// When a chunked BDAT transfer is aborted, Reset and Logout wait for its Data
+// or LMTPData call to return. Closing the connection does not wait for that
+// callback; Logout can run afterward on the transfer goroutine.
 type Session interface {
 	// Discard currently processed message.
 	Reset()
