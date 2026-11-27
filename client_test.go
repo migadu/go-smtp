@@ -24,8 +24,8 @@ import (
 // Don't send a trailing space on AUTH command when there's no initial response:
 // https://github.com/golang/go/issues/17794
 func TestClientAuthTrimSpace(t *testing.T) {
-	server := "220 hello world\r\n" +
-		"200 some more"
+	server := "535 5.7.8 Authentication credentials invalid\r\n" +
+		"501 5.7.0 Authentication canceled\r\n"
 	var wrote bytes.Buffer
 	var fake faker
 	fake.ReadWriter = struct {
@@ -37,7 +37,10 @@ func TestClientAuthTrimSpace(t *testing.T) {
 	}
 	c := NewClient(fake)
 	c.didHello = true
-	c.Auth(toServerNoRespAuth{})
+	var smtpErr *SMTPError
+	if err := c.Auth(toServerNoRespAuth{}); !errors.As(err, &smtpErr) || smtpErr.Code != 535 {
+		t.Fatalf("Auth = %v; want SMTP error 535", err)
+	}
 	c.Close()
 	if got, want := wrote.String(), "AUTH FOOAUTH\r\n*\r\n"; got != want {
 		t.Errorf("wrote %q; want %q", got, want)
@@ -223,6 +226,9 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("Second EHLO failed: %s", err)
 	}
 
+	// The fake server sends no greeting; mark the session as greeted and
+	// said hello, as helo/ehlo above would have on a real one.
+	c.didGreet = true
 	c.didHello = true
 	if ok, args := c.Extension("aUtH"); !ok || args != "LOGIN PLAIN" {
 		t.Fatalf("Expected AUTH supported")
@@ -583,7 +589,10 @@ func TestHello(t *testing.T) {
 		case 6:
 			err = c.Reset()
 		case 7:
-			err = c.Quit()
+			// Quit sends no hello of its own; say it first.
+			if err = c.hello(); err == nil {
+				err = c.Quit()
+			}
 		case 8:
 			err = c.Verify("test@example.com")
 			if err != nil {
