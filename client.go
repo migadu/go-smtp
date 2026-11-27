@@ -203,16 +203,48 @@ func (c *Client) endAfterSetupError(err error) {
 }
 
 func initStartTLS(c *Client, tlsConfig *tls.Config) error {
-	if err := c.hello(); err != nil {
-		return err
-	}
-	if ok, _ := c.Extension("STARTTLS"); !ok {
+	started, err := c.startTLSIfOffered(tlsConfig)
+	if err == nil && !started {
 		return ErrSTARTTLSUnsupported
 	}
-	if err := c.startTLS(tlsConfig); err != nil {
-		return err
+	return err
+}
+
+// NewClientStartTLSIfOfferedWithName creates a client and greets the server
+// using localName. When EHLO offers STARTTLS, it sends the STARTTLS command.
+// When STARTTLS is absent, including after a fallback to HELO, it returns the
+// greeted plaintext client on the original connection with started set to false.
+// An error during setup closes the connection.
+//
+// A true started means the server accepted STARTTLS and the connection is
+// wrapped in TLS. The handshake and certificate verification run on the next
+// I/O. To complete them before using the session, call Hello(localName) and
+// check its error. TLSConnectionState reports whether the handshake completed.
+func NewClientStartTLSIfOfferedWithName(conn net.Conn, tlsConfig *tls.Config, localName string) (c *Client, started bool, err error) {
+	c = NewClient(conn)
+	if err := c.SetLocalName(localName); err != nil {
+		c.Close()
+		return nil, false, err
 	}
-	return nil
+	started, err = c.startTLSIfOffered(tlsConfig)
+	if err != nil {
+		c.endAfterSetupError(err)
+		return nil, false, err
+	}
+	return c, started, nil
+}
+
+func (c *Client) startTLSIfOffered(tlsConfig *tls.Config) (bool, error) {
+	if err := c.hello(); err != nil {
+		return false, err
+	}
+	if ok, _ := c.Extension("STARTTLS"); !ok {
+		return false, nil
+	}
+	if err := c.startTLS(tlsConfig); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // NewClientLMTP returns a new LMTP Client (as defined in RFC 2033) using an
@@ -440,10 +472,13 @@ func (c *Client) ehlo() error {
 		extList = extList[1:]
 		for _, line := range extList {
 			args := strings.SplitN(line, " ", 2)
+			// RFC 5321 section 4.1.1.1 defines ASCII case-insensitive
+			// keywords. Preserve the spelling of the extension parameters.
+			keyword := toUpperASCII(args[0])
 			if len(args) > 1 {
-				ext[args[0]] = args[1]
+				ext[keyword] = args[1]
 			} else {
-				ext[args[0]] = ""
+				ext[keyword] = ""
 			}
 		}
 	}
@@ -1009,7 +1044,7 @@ func (c *Client) Extension(ext string) (bool, string) {
 	if err := c.hello(); err != nil {
 		return false, ""
 	}
-	ext = strings.ToUpper(ext)
+	ext = toUpperASCII(ext)
 	param, ok := c.ext[ext]
 	return ok, param
 }
