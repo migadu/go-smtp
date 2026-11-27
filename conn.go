@@ -44,6 +44,8 @@ type Conn struct {
 	// Number of failed AUTH attempts witnessed on this connection
 	authFailures int
 
+	idle bool // waiting for a command outside a BDAT transfer; guarded by locker
+
 	// First error encountered while writing a response. Once set, the serve
 	// loop tears the connection down: the client can no longer observe
 	// replies, so processing further commands is pointless. Only accessed
@@ -2028,6 +2030,42 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 	}
 }
 
+// readCommand reports closing if CloseIdle has asked the serve loop to end
+// this connection instead of handling another command.
+func (c *Conn) readCommand() (line string, closing bool, err error) {
+	// Arm the deadline before advertising the idle read, so it cannot
+	// overwrite the deadline that CloseIdle uses to interrupt the read.
+	if err := c.armReadDeadline(time.Time{}); err != nil {
+		return "", false, err
+	}
+
+	c.locker.Lock()
+	idle := c.bdatPipe == nil
+	if idle && c.server.closingIdle.Load() {
+		c.locker.Unlock()
+		return "", true, nil
+	}
+	c.idle = idle
+	c.locker.Unlock()
+
+	line, err = c.readArmedLine()
+
+	c.locker.Lock()
+	closing = c.idle && c.server.closingIdle.Load()
+	c.idle = false
+	c.locker.Unlock()
+	return line, closing, err
+}
+
+// interruptIdle wakes a connection waiting for its next command.
+func (c *Conn) interruptIdle() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.idle {
+		c.conn.SetReadDeadline(time.Now())
+	}
+}
+
 // armReadDeadline sets the deadline for the next read of client input:
 // ReadTimeout from now, capped by the session deadline and by limit, if
 // non-zero. When nothing bounds the read it leaves the connection's deadline
@@ -2071,14 +2109,16 @@ func (c *Conn) endAfterContentError(err error) {
 	c.Close()
 }
 
-// Reads a line of input, enforcing Server.MaxLineLength on the line itself
-// (excluding CRLF). Bytes buffered behind the line — such as a pipelined BDAT
-// chunk following its command — do not count toward the limit.
 func (c *Conn) readLine() (string, error) {
 	if err := c.armReadDeadline(time.Time{}); err != nil {
 		return "", err
 	}
+	return c.readArmedLine()
+}
 
+// readArmedLine enforces Server.MaxLineLength on the line itself (excluding
+// CRLF), leaving any buffered input after the line for the caller.
+func (c *Conn) readArmedLine() (string, error) {
 	var line []byte
 	for {
 		l, more, err := c.text.R.ReadLine()

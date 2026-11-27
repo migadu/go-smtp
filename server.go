@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -172,6 +173,8 @@ type Server struct {
 	locker    sync.Mutex
 	listeners []net.Listener
 	conns     map[*Conn]struct{}
+
+	closingIdle atomic.Bool // set by CloseIdle
 }
 
 // New creates a new SMTP server.
@@ -346,7 +349,11 @@ func (s *Server) handleConn(c *Conn) error {
 			return nil
 		}
 
-		line, err := c.readLine()
+		line, closing, err := c.readCommand()
+		if closing {
+			c.writeResponse(421, EnhancedCode{4, 3, 2}, "Server is shutting down, please try again later")
+			return nil
+		}
 		if err != nil {
 			return c.readError(err)
 		}
@@ -453,6 +460,23 @@ func (s *Server) Close() error {
 	s.locker.Unlock()
 
 	return err
+}
+
+// CloseIdle replies 421 and closes connections that are waiting for a command.
+// Other connections receive the same reply when they next wait for a command.
+// Commands in progress, including DATA and BDAT transfers and delivery, can
+// finish first. The wait between BDAT chunks counts as part of the transfer.
+//
+// Call CloseIdle after stopping the listeners, then wait for the remaining
+// connections to finish. CloseIdle returns after signaling idle reads and
+// lets active connection contexts run until their connections close.
+func (s *Server) CloseIdle() {
+	s.closingIdle.Store(true)
+	s.locker.Lock()
+	defer s.locker.Unlock()
+	for c := range s.conns {
+		c.interruptIdle()
+	}
 }
 
 // Shutdown gracefully shuts down the server without interrupting any
