@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ type bdatLifecycleSession struct {
 	ctxSession
 	conn          *smtp.Conn
 	closeFromData bool
+	panicInLogout bool
 	interrupted   chan struct{}
 	allowReturn   chan struct{}
 	loggedOut     chan struct{}
@@ -36,20 +38,37 @@ func (s *bdatLifecycleSession) Data(_ context.Context, r io.Reader) error {
 }
 
 func (s *bdatLifecycleSession) Logout() error {
-	close(s.loggedOut)
+	defer close(s.loggedOut)
+	if s.panicInLogout {
+		panic("backend Logout panic")
+	}
 	return nil
 }
 
+type bdatPanicLog chan struct{}
+
+func (l bdatPanicLog) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "backend Logout panic") {
+		close(l)
+	}
+	return len(p), nil
+}
+
 func TestServer_BDATLogoutWaitsForData(t *testing.T) {
-	for _, how := range []string{"STARTTLS", "client disconnect", "Server.Close", "Close from Data"} {
+	for _, how := range []string{"STARTTLS", "client disconnect", "Server.Close", "Close from Data", "panicking Logout after QUIT"} {
 		t.Run(how, func(t *testing.T) {
 			session := &bdatLifecycleSession{
 				closeFromData: how == "Close from Data",
+				panicInLogout: how == "panicking Logout after QUIT",
 				interrupted:   make(chan struct{}),
 				allowReturn:   make(chan struct{}),
 				loggedOut:     make(chan struct{}),
 			}
+			panicLogged := make(bdatPanicLog)
 			_, server, conn, scanner, _ := testServerEhlo(t, withTLS, func(s *smtp.Server) {
+				if session.panicInLogout {
+					s.ErrorLog = log.New(panicLogged, "", 0)
+				}
 				s.Backend = smtp.BackendFunc(func(c *smtp.Conn) (smtp.Session, error) {
 					session.conn = c
 					return session, nil
@@ -84,6 +103,9 @@ func TestServer_BDATLogoutWaitsForData(t *testing.T) {
 				}
 			case "client disconnect":
 				conn.Close()
+			case "panicking Logout after QUIT":
+				io.WriteString(conn, "QUIT\r\n")
+				expect("221 ")
 			case "Server.Close":
 				done := make(chan error, 1)
 				go func() { done <- server.Close() }()
@@ -111,6 +133,13 @@ func TestServer_BDATLogoutWaitsForData(t *testing.T) {
 			case <-session.loggedOut:
 			case <-time.After(time.Second):
 				t.Fatal("Logout did not run after Data returned")
+			}
+			if session.panicInLogout {
+				select {
+				case <-panicLogged:
+				case <-time.After(time.Second):
+					t.Fatal("Logout panic was not logged")
+				}
 			}
 		})
 	}

@@ -1768,6 +1768,13 @@ func (c *Conn) endBdat(done chan struct{}) {
 	c.bdatLogout = nil
 	c.locker.Unlock()
 	if session != nil {
+		// A deferred Logout runs on the worker, beyond the server command's
+		// panic handler. The transport is already closing, so only log it.
+		defer func() {
+			if err := recover(); err != nil {
+				c.handlePanic(err, nil)
+			}
+		}()
 		c.logoutSession(session)
 	}
 }
@@ -1788,7 +1795,7 @@ func (c *Conn) handlePanic(err interface{}, status *statusCollector) {
 	}
 
 	stack := debug.Stack()
-	c.server.ErrorLog.Printf("panic serving %v: %v\n%s", c.conn.RemoteAddr(), err, stack)
+	c.server.ErrorLog.Printf("panic serving %v: %v\n%s", c.Conn().RemoteAddr(), err, stack)
 }
 
 func (c *Conn) createStatusCollector() *statusCollector {
