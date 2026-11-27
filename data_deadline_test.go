@@ -205,6 +205,36 @@ func TestReadTimeoutAppliesToEachContentRead(t *testing.T) {
 	}
 }
 
+func TestDataReadTimeoutOverridesCommandTimeout(t *testing.T) {
+	for _, mode := range transferModes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			tt := startTransfer(t, mode, func(s *smtp.Server) {
+				s.ReadTimeout = 250 * time.Millisecond
+				s.DataReadTimeout = 2 * time.Second
+			})
+			tt.begin(2 * len(trickleLine))
+			io.WriteString(tt.conn, trickleLine)
+			time.Sleep(500 * time.Millisecond)
+			io.WriteString(tt.conn, trickleLine)
+			tt.end()
+
+			if r := tt.result(); r.err != nil || r.n != 2*len(trickleLine) {
+				t.Fatalf("backend read %d of %d bytes, error %v", r.n, 2*len(trickleLine), r.err)
+			}
+			if reply := tt.reply(); !strings.HasPrefix(reply, "250 ") {
+				t.Fatalf("transfer answered %q", reply)
+			}
+
+			// The next command still has the shorter ReadTimeout. A client
+			// deadline between the two timeouts catches leakage from DATA.
+			tt.conn.SetReadDeadline(time.Now().Add(time.Second))
+			readGreetingReply(t, tt.scanner, "421")
+		})
+	}
+}
+
 // A client that stops sending in the middle of the content is cut off. The
 // rest of its input can no longer be told apart from commands, so after the
 // reply the server closes the connection (RFC 5321 section 3.8 allows closing
@@ -267,7 +297,7 @@ func TestSessionDeadlineCapsContentRead(t *testing.T) {
 		mode := mode
 		t.Run(mode.name, func(t *testing.T) {
 			t.Parallel()
-			tt := startTransfer(t, mode, func(s *smtp.Server) { s.ReadTimeout = time.Minute })
+			tt := startTransfer(t, mode, func(s *smtp.Server) { s.DataReadTimeout = time.Minute })
 			tt.smtpc.SetSessionDeadline(time.Now().Add(300 * time.Millisecond))
 			tt.begin(40 * len(trickleLine))
 			go trickle(tt.conn, 40, 50*time.Millisecond)
@@ -292,7 +322,7 @@ func TestDataTimeoutBoundsTransfer(t *testing.T) {
 			t.Parallel()
 			var timeouts atomic.Int32
 			tt := startTransfer(t, mode, func(s *smtp.Server) {
-				s.ReadTimeout = time.Minute
+				s.DataReadTimeout = time.Minute
 				s.DataTimeout = 300 * time.Millisecond
 				s.OnTimeout = func() { timeouts.Add(1) }
 			})
@@ -323,18 +353,30 @@ func TestDataTimeoutBoundsTransfer(t *testing.T) {
 	}
 }
 
-// The deadline DataTimeout sets ends with its transfer, also when no
-// ReadTimeout replaces it: the next command may arrive later than that.
 func TestDataTimeoutEndsWithTransfer(t *testing.T) {
+	testContentDeadlineEndsWithTransfer(t, func(s *smtp.Server) {
+		s.DataTimeout = 200 * time.Millisecond
+	})
+}
+
+func TestDataReadTimeoutEndsWithTransfer(t *testing.T) {
+	testContentDeadlineEndsWithTransfer(t, func(s *smtp.Server) {
+		s.DataReadTimeout = 200 * time.Millisecond
+	})
+}
+
+// Each content deadline ends with its transfer. The next command may arrive
+// later when the server leaves ReadTimeout at zero.
+func testContentDeadlineEndsWithTransfer(t *testing.T, configure func(*smtp.Server)) {
+	t.Helper()
 	for _, mode := range transferModes {
 		mode := mode
 		t.Run(mode.name, func(t *testing.T) {
 			t.Parallel()
-			tt := startTransfer(t, mode, func(s *smtp.Server) {
-				s.ReadTimeout = 0
-				s.DataTimeout = 200 * time.Millisecond
-			})
-			tt.begin(len(trickleLine))
+			tt := startTransfer(t, mode, configure)
+			tt.begin(2 * len(trickleLine))
+			io.WriteString(tt.conn, trickleLine)
+			time.Sleep(50 * time.Millisecond)
 			io.WriteString(tt.conn, trickleLine)
 			tt.end()
 			if r := tt.result(); r.err != nil {

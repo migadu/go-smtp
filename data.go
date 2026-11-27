@@ -50,8 +50,8 @@ var ErrDataTooLarge = &SMTPError{
 }
 
 // contentReader reads message content, a DATA body or a BDAT chunk, from the
-// connection. ReadTimeout bounds each wait for more content rather than the
-// whole transfer: RFC 5321 section 4.5.3.2 sets "a timer ... for each buffer
+// connection. DataReadTimeout (or ReadTimeout when unset) bounds each wait
+// for more content. RFC 5321 section 4.5.3.2 sets "a timer ... for each buffer
 // of the data transfer", so that "the overall timeout is inherently
 // proportional to the size of the message". Before every read that has to
 // wait for the client, the read deadline is re-armed, capped by the session
@@ -82,7 +82,11 @@ func (cr *contentReader) wait() error {
 	if cr.r.Buffered() > 0 {
 		return nil
 	}
-	return cr.c.armReadDeadline(cr.deadline)
+	timeout := cr.c.server.DataReadTimeout
+	if timeout == 0 {
+		timeout = cr.c.server.ReadTimeout
+	}
+	return cr.c.armReadDeadlineWithTimeout(cr.deadline, timeout)
 }
 
 func (cr *contentReader) fail(err error) error {

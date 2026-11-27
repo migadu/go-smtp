@@ -1977,19 +1977,26 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 // ReadTimeout from now, capped by the session deadline and by limit, if
 // non-zero. When nothing bounds the read it leaves the connection's deadline
 // alone, unless one may have been set before (a session deadline since
-// disabled, or a DataTimeout), which it clears.
+// disabled or a message content deadline), which it clears.
 func (c *Conn) armReadDeadline(limit time.Time) error {
+	return c.armReadDeadlineWithTimeout(limit, c.server.ReadTimeout)
+}
+
+// armReadDeadlineWithTimeout caps the next read's timeout by the session
+// deadline and by limit. With no bound, it clears a deadline previously set
+// for message content or by a session limit that has since been disabled.
+func (c *Conn) armReadDeadlineWithTimeout(limit time.Time, timeout time.Duration) error {
 	deadline, configured := c.getSessionDeadline()
 	if !limit.IsZero() && (deadline.IsZero() || limit.Before(deadline)) {
 		deadline = limit
 	}
-	if c.server.ReadTimeout != 0 {
-		idleDeadline := time.Now().Add(c.server.ReadTimeout)
+	if timeout != 0 {
+		idleDeadline := time.Now().Add(timeout)
 		if deadline.IsZero() || idleDeadline.Before(deadline) {
 			deadline = idleDeadline
 		}
 	}
-	if configured || !deadline.IsZero() || c.server.DataTimeout != 0 {
+	if configured || !deadline.IsZero() || c.server.DataTimeout != 0 || c.server.DataReadTimeout != 0 {
 		return c.conn.SetReadDeadline(deadline)
 	}
 	return nil
